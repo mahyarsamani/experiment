@@ -1,11 +1,48 @@
-#!/usr/bin/python
-
-
 import os
+import json
 import argparse
 import subprocess
 
-from .configurator import _get_project_config, _parse_build_opt
+from .configurator import (
+    _get_project_config,
+    _parse_build_opt,
+    _get_settings_list,
+    _get_default_settings,
+    _get_automate_settings,
+)
+
+
+def finalize_init_args(init_args, unknown_args):
+    assert (unknown_args is None) or (len(unknown_args) == 0)
+
+    configuration = {}
+
+    settings = _get_settings_list()
+    defaults = _get_default_settings()
+    automate = _get_automate_settings()
+
+    for setting in settings:
+        if not getattr(init_args, setting) is None:
+            configuration[setting] = getattr(init_args, setting)
+        elif setting in defaults:
+            print(
+                f"Setting {setting} not specified. "
+                f"Defaulting to {defaults[setting]}."
+            )
+            configuration[setting] = defaults[setting]
+        elif setting in automate:
+            prereqs, command, message = automate[setting]
+            print(message)
+            for prereq in prereqs:
+                eval(prereq)
+            configuration[setting] = eval(command)
+        else:
+            raise RuntimeError(f"Don't know what to do with {setting}.")
+
+    with open("project_config.json", "w") as config_file:
+        json.dump(configuration, config_file, indent=2)
+
+    return []
 
 
 def finalize_build_args(build_args, unknown_args):
@@ -63,7 +100,7 @@ def finalize_run_args(run_args, unknown_args):
 
     command = f"{base_dir}/{project_name}/build/{isa}_{protocol}/gem5.{opt}"
     if not run_args.outdir is None:
-        outdir_base = os.getenv("GEM5_OUT_BASE_DIR", "/scr/gem5-out")
+        outdir_base = configuration["gem5_out_base_dir"]
         command += (
             f" -re --outdir={outdir_base}/{project_name}/{run_args.outdir}"
         )
@@ -90,7 +127,6 @@ def finalize_help_args(help_args, unknown_args):
     configuration = _get_project_config()
 
     isa, protocol, opt = _parse_build_opt(help_args.build_opt)
-    base_dir = os.getenv("GEM5_BINARY_BASE_DIR", "/scr/gem5-binary")
     base_dir = configuration["gem5_binary_base_dir"]
     project_name = configuration["project_name"]
 
@@ -107,6 +143,49 @@ def finalize_help_args(help_args, unknown_args):
 def parse_command_line():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(help="sub-command help", dest="command")
+    init = subparsers.add_parser("init", description="Initiate a project.")
+    init.add_argument(
+        "gem5_binary_base_dir",
+        type=str,
+        help="Path to the directory to store the gem5 binaries. "
+        "Typically shared among projects.",
+    )
+    init.add_argument(
+        "gem5_out_base_dir",
+        type=str,
+        help="Path to the directory to store the gem5 outputs "
+        "(simout, simerr, stats, ...). Typically shared among projects.",
+    )
+    init.add_argument(
+        "--project-name", type=str, help="Name of the project.", required=False
+    )
+    init.add_argument(
+        "--default-isa",
+        type=str,
+        help="Default isa for the project.",
+        required=False,
+        choices=["x86", "arm", "riscv"],
+    )
+    init.add_argument(
+        "--default-protocol",
+        type=str,
+        help="Default protocol for the project.",
+        required=False,
+        choices=["chi", "mesi_two_level", "mesi_three_level", "mi_example"],
+    )
+    init.add_argument(
+        "--default-binary-opt",
+        type=str,
+        help="Default binary option to use.",
+        required=False,
+        choices=["debug", "opt", "fast"],
+    )
+    init.add_argument(
+        "--gem5-dir",
+        type=str,
+        help="Path to the gem5 directory.",
+        required=False,
+    )
 
     build = subparsers.add_parser("build", description="Build gem5")
     build.add_argument(
@@ -198,7 +277,9 @@ def parse_command_line():
     )
 
     known_args, unknown_args = parser.parse_known_args()
-    if known_args.command == "build":
+    if known_args.command == "init":
+        recipe = finalize_init_args(known_args, unknown_args)
+    elif known_args.command == "build":
         recipe = finalize_build_args(known_args, unknown_args)
     elif known_args.command == "run":
         recipe = finalize_run_args(known_args, unknown_args)
@@ -217,11 +298,11 @@ def parse_command_line():
     return recipe
 
 
-if __name__ == "__main__":
+def main_function():
     recipe = parse_command_line()
     for command, cwd in recipe:
         print(f"Running {command} in {cwd}")
-        result = subprocess.run(
+        subprocess.run(
             command,
             shell=True,
             cwd=cwd,

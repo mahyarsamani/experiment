@@ -4,16 +4,18 @@ import re
 from pathlib import Path
 from typing import Dict, Union
 from collections import OrderedDict
-from .stats import Stats, ScalarStat, HistogramStat
+from ..helper.configurator import _get_project_config
+from .stats import Stats, ScalarStat, HistogramStat, try_convert_numerical
 
 line_patterns = OrderedDict(
     {
-        r"\S+::\w+.+": HistogramStat,
+        # r"\S+::\w+.+": HistogramStat,
         r"\S+\.\w+\s[^\|]+": ScalarStat,
     }
 )
 
 ignore_patterns = [
+    r"\S+::\w+.+",
     r"\(\w+/\w+\)",
     r"\(Unspecified\)",
     r".*avg.*|.*Avg.*|.*average.*|.*Average.*",
@@ -48,43 +50,29 @@ def process_stats_file(stats_file) -> Stats:
     return stats
 
 
-def process_experiment_directory(exp_name: str) -> Dict:
-    def get_project_prefix():
-        cwd = os.path.abspath(os.getcwd())
-        # TODO: Improve how to detect if in gem5 dir
-        assert "gem5" in os.listdir(cwd)
-        return os.path.basename(cwd)
-
+def process_experiment(exp_name: str) -> Dict:
     def parse_path(path: Union[str, Path]):
-        def try_convert_numerical(value):
-            ret = None
-            try:
-                ret = int(value)
-            except:
-                try:
-                    ret = float(value)
-                except:
-                    ret = value
-            assert not ret is None
-            return ret
-
-        project_prefix = get_project_prefix()
-
-        _, post = str(path).split(project_prefix)
-        tokens = post.split("/")
-        experiment_prefix = tokens[0]
-        other_tokens = tokens[1:]
-        print(tokens)
-        print(other_tokens)
         ret = {}
-        for token in other_tokens:
+        for token in path.split("/"):
             name, value = token.split("_")
             value = try_convert_numerical(value)
             ret[name] = value
         return ret
 
+    project_config = _get_project_config()
+    exp_dir = os.path.join(
+        project_config["gem5_out_base_dir"],
+        project_config["project_name"],
+        exp_name,
+    )
+
+    ret = []
     for subdir, _, files in os.walk(exp_dir):
         if "stats.txt" in files:
-            print(subdir)
-            configuration = parse_path(subdir)
-            print(configuration)
+            rel_path = os.path.relpath(subdir, exp_dir)
+            parameters = parse_path(rel_path)
+            with open(os.path.join(subdir, "stats.txt"), "r") as stats_file:
+                stats = process_stats_file(stats_file)
+                stats.set_parameters(parameters)
+                ret.append(stats)
+    return ret

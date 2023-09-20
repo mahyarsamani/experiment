@@ -1,8 +1,8 @@
 import re
 
 from enum import Enum
-from typing import Union, List
 from collections import OrderedDict
+from typing import Union, List, Dict
 from abc import ABCMeta, abstractmethod, abstractclassmethod
 
 
@@ -12,6 +12,19 @@ def extract_numerical_substrings(string):
 
 def remove_numerical_characters(string):
     return re.sub(r"\d+", "", string)
+
+
+def try_convert_numerical(value):
+    ret = None
+    try:
+        ret = int(value)
+    except:
+        try:
+            ret = float(value)
+        except:
+            ret = value
+    assert not ret is None
+    return ret
 
 
 class DataDigest(Enum):
@@ -186,6 +199,10 @@ class HistogramStat(Stat):
 class Stats:
     def __init__(self):
         self._container = {}
+        self._parameters = {}
+
+    def set_parameters(self, parameters: Dict) -> None:
+        self._parameters = parameters
 
     def items(self):
         return self._container.items()

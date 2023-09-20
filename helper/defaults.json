@@ -1,0 +1,5 @@
+{
+  "default_isa": "arm",
+  "default_binary_opt": "fast",
+  "default_protocol": "chi"
+}
