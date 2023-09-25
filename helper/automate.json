@@ -1,4 +1,0 @@
-{
-    "project_name": [[], "os.path.basename(os.getcwd())", "No value set for project_name. Setting project_name to the name of the current directory."],
-    "gem5_dir": [["subprocess.run(\"git clone https://www.github.com/gem5/gem5.git\", shell=True)"], "os.path.join(os.getcwd(), \"gem5\")", "No value set for gem5_dir. Cloning gem5 and pointing gem5_dir to it."]
-}

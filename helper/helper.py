@@ -3,20 +3,63 @@ import json
 import argparse
 import subprocess
 
-from .configurator import (
+from .configuration import (
     _get_project_config,
-    _parse_build_opt,
     _get_settings_list,
     _get_default_settings,
     _get_automate_settings,
 )
+
+isa_translator = {"x86": "X86", "arm": "ARM", "riscv": "RISCV"}
+
+protocol_translator = {
+    "chi": "CHI",
+    "mesi_two_level": "MESI_Two_Level",
+    "mesi_three_level": "MESI_Three_Level",
+    "mi_example": "MI_example",
+}
+
+binary_opt_translator = {"debug": "debug", "opt": "opt", "fast": "fast"}
+
+translators = [
+    (isa_translator, "isa"),
+    (protocol_translator, "protocol"),
+    (binary_opt_translator, "binary_opt"),
+]
+
+
+def _parse_build_opt(build_opt, configuration):
+    ret = {}
+    if build_opt is None:
+        ret["isa"] = isa_translator[configuration["default_isa"]]
+        ret["protocol"] = protocol_translator[
+            configuration["default_protocol"]
+        ]
+        ret["binary_opt"] = binary_opt_translator[
+            configuration["default_binary_opt"]
+        ]
+    else:
+        build_opts = build_opt.split("-")
+        for opt in build_opts:
+            for translator, key in translators:
+                if opt in translator:
+                    if key in ret:
+                        raise RuntimeError(
+                            f"More than one option passed for {key}."
+                        )
+                    ret[key] = translator[opt]
+
+    for translator, key in translators:
+        if not key in ret:
+            ret[key] = configuration[f"default_{key}"]
+
+    return ret["isa"], ret["protocol"], ret["binary_opt"]
 
 
 def finalize_init_args(init_args, unknown_args):
     assert (unknown_args is None) or (len(unknown_args) == 0)
 
     configuration = {}
-
     settings = _get_settings_list()
     defaults = _get_default_settings()
     automate = _get_automate_settings()
@@ -31,11 +74,7 @@ def finalize_init_args(init_args, unknown_args):
             )
             configuration[setting] = defaults[setting]
         elif setting in automate:
-            prereqs, command, message = automate[setting]
-            print(message)
-            for prereq in prereqs:
-                eval(prereq)
-            configuration[setting] = eval(command)
+            configuration[setting] = automate[setting]()
         else:
             raise RuntimeError(f"Don't know what to do with {setting}.")
 
@@ -155,6 +194,14 @@ def parse_command_line():
         type=str,
         help="Path to the directory to store the gem5 outputs "
         "(simout, simerr, stats, ...). Typically shared among projects.",
+    )
+    init.add_argument(
+        "--fix",
+        dest="fix",
+        action="store_const",
+        const=True,
+        default=False,
+        help="Fix configuration file.",
     )
     init.add_argument(
         "--project-name", type=str, help="Name of the project.", required=False

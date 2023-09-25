@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from typing import Dict, Union
 from collections import OrderedDict
-from ..helper.configurator import _get_project_config
+from ..helper.configuration import _get_project_config
 from .stats import Stats, ScalarStat, HistogramStat, try_convert_numerical
 
 line_patterns = OrderedDict(
