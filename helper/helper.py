@@ -51,7 +51,9 @@ def _parse_build_opt(build_opt, configuration):
 
     for translator, key in translators:
         if not key in ret:
-            ret[key] = translator[configuration[f"default_{key}"]]
+            default = translator[configuration[f"default_{key}"]]
+            print(f"No {key} specified. Using {default} for {key}.")
+            ret[key] = default
 
     return ret["isa"], ret["protocol"], ret["binary_opt"]
 
@@ -92,6 +94,10 @@ def finalize_build_args(build_args, unknown_args):
     isa, protocol, opt = _parse_build_opt(build_args.build_opt, configuration)
 
     if build_args.threads is None:
+        print(
+            f"Number of threads not specified. "
+            "Using 7/8 of available cores by default."
+        )
         threads = int(os.cpu_count() * 7 / 8) or 1
     else:
         threads = build_args.threads
@@ -196,14 +202,6 @@ def parse_command_line():
         "(simout, simerr, stats, ...). Typically shared among projects.",
     )
     init.add_argument(
-        "--fix",
-        dest="fix",
-        action="store_const",
-        const=True,
-        default=False,
-        help="Fix configuration file.",
-    )
-    init.add_argument(
         "--project-name", type=str, help="Name of the project.", required=False
     )
     init.add_argument(
@@ -299,13 +297,13 @@ def parse_command_line():
         "--debug-start",
         dest="debug_start",
         type=int,
-        help="Debug start tick to pass to pass to gem5.",
+        help="Debug start tick to pass to gem5.",
         required=False,
     )
     run.add_argument(
         "--debug-end",
         type=int,
-        help="Debug start tick to pass to pass to gem5.",
+        help="Debug start tick to pass to gem5.",
         required=False,
     )
 
