@@ -51,7 +51,7 @@ def _parse_build_opt(build_opt, configuration):
 
     for translator, key in translators:
         if not key in ret:
-            ret[key] = configuration[f"default_{key}"]
+            ret[key] = translator[configuration[f"default_{key}"]]
 
     return ret["isa"], ret["protocol"], ret["binary_opt"]
 
