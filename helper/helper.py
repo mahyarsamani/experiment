@@ -136,6 +136,9 @@ def finalize_build_args(build_args, unknown_args):
 
 def finalize_run_args(run_args, unknown_args):
     assert run_args.command == "run"
+    assert not (
+        (not run_args.outdir is None) and (not run_args.experiment is None)
+    )
 
     configuration = _get_project_config()
 
@@ -149,12 +152,19 @@ def finalize_run_args(run_args, unknown_args):
         command += (
             f" -re --outdir={outdir_base}/{project_name}/{run_args.outdir}"
         )
+    if not run_args.experiment is None:
+        outdir_base = configuration["gem5_out_base_dir"]
+        addition = f" -re --outdir={outdir_base}/{project_name}/"
+        for arg in unknown_args:
+            addition += f"{arg}/"
     if not run_args.debug_flags is None:
         command += f" --debug-flags={run_args.debug_flags}"
     if not run_args.debug_start is None:
         command += f" --debug-start={run_args.debug_start}"
     if not run_args.debug_start is None:
         command += f" --debug-end={run_args.debug_end}"
+    if run_args.gdb:
+        command = "gdb --args " + command
     if run_args.override:
         command = "M5_OVERRIDE_PY_SOURCE=true " + command
     command += f" {run_args.config}"
@@ -283,6 +293,14 @@ def parse_command_line():
         const=True,
         default=False,
         help="Override m5 python source.",
+    )
+    run.add_argument(
+        "--with-gdb",
+        dest="gdb",
+        action="store_const",
+        const=True,
+        default=False,
+        help="Run with gdb.",
     )
     run.add_argument(
         "--outdir", type=str, help="gem5's output directory.", required=False
