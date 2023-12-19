@@ -127,10 +127,10 @@ def finalize_build_args(build_args, unknown_args):
     build_dir = os.path.join(current_path, f"{isa.lower()}-{protocol.lower()}")
     build_config = os.path.join(build_dir, "gem5.build")
     if os.path.exists(build_config):
-        print(f"{build_config} already exists. Deleting it.")
+        print(f"Path {build_config} already exists. Deleting it.")
         shutil.rmtree(build_config)
     else:
-        print(f"{build_config} does not exist.")
+        print(f"Path {build_config} does not exist.")
 
     command = (
         f'scons setconfig {build_dir} BUILD_ISA="y" '
@@ -139,7 +139,7 @@ def finalize_build_args(build_args, unknown_args):
     if not build_args.bits_per_set is None:
         command += f" NUMBER_BITS_PER_SET={build_args.bits_per_set}"
     if platform.machine() in kvm_support:
-        command += f" USE_KVM=y KVM_ISA={kvm_support(platform.machine())}"
+        command += f" USE_KVM=y KVM_ISA={kvm_support[platform.machine()]}"
     ret = [(command, gem5_dir)]
 
     command = f"scons {build_dir}/gem5.{opt} -j {threads}"
