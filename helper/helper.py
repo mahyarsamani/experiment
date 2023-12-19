@@ -1,6 +1,8 @@
 import os
 import json
+import shutil
 import argparse
+import platform
 import subprocess
 
 from .configuration import (
@@ -20,6 +22,8 @@ protocol_translator = {
 }
 
 binary_opt_translator = {"debug": "debug", "opt": "opt", "fast": "fast"}
+
+kvm_support = {"aarch64": "arm", "x86_64": "x86"}
 
 translators = [
     (isa_translator, "isa"),
@@ -120,25 +124,39 @@ def finalize_build_args(build_args, unknown_args):
             print(f"Path {test_path} already exists.")
         current_path = test_path
 
+    build_dir = os.path.join(current_path, f"{isa.lower()}-{protocol.lower()}")
+    build_config = os.path.join(build_dir, "gem5.build")
+    if os.path.exists(build_config):
+        print(f"{build_config} already exists. Deleting it.")
+        shutil.rmtree(build_config)
+    else:
+        print(f"{build_config} does not exist.")
+
     command = (
-        f"scons {current_path}/build/{isa}_{protocol}/gem5.{opt} "
-        f"--default={isa} PROTOCOL={protocol} -j {threads}"
+        f'scons setconfig {build_dir} BUILD_ISA="y" '
+        f'USE_{isa}_ISA="y" RUBY="y" RUBY_PROTOCOL_{protocol}="y"'
     )
-    if build_args.gold:
-        command += " --linker=gold"
     if not build_args.bits_per_set is None:
         command += f" NUMBER_BITS_PER_SET={build_args.bits_per_set}"
+    if platform.machine() in kvm_support:
+        command += f" USE_KVM=y KVM_ISA={kvm_support(platform.machine())}"
     ret = [(command, gem5_dir)]
+
+    command = f"scons {build_dir}/gem5.{opt} -j {threads}"
+    if build_args.gold:
+        command += " --linker=gold"
+    ret += [(command, gem5_dir)]
+
     if not build_args.no_link:
-        ret += [(f"ln -sf {current_path}/build build", gem5_dir)]
+        ret += [(f"ln -sf {current_path} build", gem5_dir)]
     return ret
 
 
 def finalize_run_args(run_args, unknown_args):
     assert run_args.command == "run"
-    assert not (
-        (not run_args.outdir is None) and (not run_args.experiment is None)
-    )
+    # assert not (
+    #     (not run_args.outdir is None) and (not run_args.experiment is None)
+    # )
 
     configuration = _get_project_config()
 
@@ -152,11 +170,11 @@ def finalize_run_args(run_args, unknown_args):
         command += (
             f" -re --outdir={outdir_base}/{project_name}/{run_args.outdir}"
         )
-    if not run_args.experiment is None:
-        outdir_base = configuration["gem5_out_base_dir"]
-        addition = f" -re --outdir={outdir_base}/{project_name}/"
-        for arg in unknown_args:
-            addition += f"{arg}/"
+    # if not run_args.experiment is None:
+    #     outdir_base = configuration["gem5_out_base_dir"]
+    #     addition = f" -re --outdir={outdir_base}/{project_name}/"
+    #     for arg in unknown_args:
+    #         addition += f"{arg}/"
     if not run_args.debug_flags is None:
         command += f" --debug-flags={run_args.debug_flags}"
     if not run_args.debug_start is None:
