@@ -193,7 +193,7 @@ def finalize_help_args(help_args, unknown_args):
 
     configuration = _get_project_config()
 
-    isa, protocol, opt = _parse_build_opt(help_args.build_opt)
+    isa, protocol, opt = _parse_build_opt(help_args.build_opt, configuration)
     base_dir = configuration["gem5_binary_base_dir"]
     project_name = configuration["project_name"]
 
