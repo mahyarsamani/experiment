@@ -124,7 +124,9 @@ def finalize_build_args(build_args, unknown_args):
             print(f"Path {test_path} already exists.")
         current_path = test_path
 
-    build_dir = os.path.join(current_path, f"{isa.lower()}-{protocol.lower()}")
+    build_dir = os.path.join(
+        current_path, f"{isa.lower()}-{protocol.lower()}-{opt.lower()}"
+    )
     build_config = os.path.join(build_dir, "gem5.build")
     if os.path.exists(build_config):
         print(f"Path {build_config} already exists. Deleting it.")
@@ -164,7 +166,7 @@ def finalize_run_args(run_args, unknown_args):
     base_dir = configuration["gem5_binary_base_dir"]
     project_name = configuration["project_name"]
 
-    command = f"{base_dir}/{project_name}/build/{isa}_{protocol}/gem5.{opt}"
+    command = f"{base_dir}/{project_name}/{isa.lower()}-{protocol.lower()}-{opt.lower()}/gem5.{opt}"
     if not run_args.outdir is None:
         outdir_base = configuration["gem5_out_base_dir"]
         command += (
@@ -203,7 +205,7 @@ def finalize_help_args(help_args, unknown_args):
     base_dir = configuration["gem5_binary_base_dir"]
     project_name = configuration["project_name"]
 
-    command = f"{base_dir}/{project_name}/build/{isa}_{protocol}/gem5.{opt}"
+    command = f"{base_dir}/{project_name}/{isa.lower()}-{protocol.lower()}-{opt.lower()}/gem5.{opt}"
     if help_args.option == "gem5":
         command += " --help"
     if help_args.option == "debug":
