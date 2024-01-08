@@ -34,15 +34,7 @@ translators = [
 
 def _parse_build_opt(build_opt, configuration):
     ret = {}
-    if build_opt is None:
-        ret["isa"] = isa_translator[configuration["default_isa"]]
-        ret["protocol"] = protocol_translator[
-            configuration["default_protocol"]
-        ]
-        ret["binary_opt"] = binary_opt_translator[
-            configuration["default_binary_opt"]
-        ]
-    else:
+    if not build_opt is None:
         build_opts = build_opt.split("-")
         for opt in build_opts:
             for translator, key in translators:
