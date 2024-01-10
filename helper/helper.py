@@ -139,6 +139,8 @@ def finalize_build_args(build_args, unknown_args):
     command = f"scons {build_dir}/gem5.{opt} -j {threads}"
     if build_args.gold:
         command += " --linker=gold"
+    if build_args.gprof:
+        command += " --gprof"
     ret += [(command, gem5_dir)]
 
     if not build_args.no_link:
@@ -280,6 +282,14 @@ def parse_command_line():
         const=True,
         default=False,
         help="Whether to use gold linker or not.",
+    )
+    build.add_argument(
+        "--gprof",
+        dest="gprof",
+        action="store_const",
+        const=True,
+        default=False,
+        help="Whether to compile gem5 with gprof.",
     )
     build.add_argument(
         "--no-link",
