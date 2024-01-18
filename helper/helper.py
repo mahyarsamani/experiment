@@ -12,9 +12,10 @@ from .configuration import (
     _get_automate_settings,
 )
 
-isa_translator = {"x86": "X86", "arm": "ARM", "riscv": "RISCV", "null": "NULL"}
+isa_translator = {"x86": "X86", "arm": "ARM", "riscv": "RISCV", "null": "null"}
 
 protocol_translator = {
+    "classic": "classic",
     "chi": "CHI",
     "mesi_two_level": "MESI_Two_Level",
     "mesi_three_level": "MESI_Three_Level",
@@ -127,12 +128,15 @@ def finalize_build_args(build_args, unknown_args):
         print(f"Path {build_config} does not exist.")
 
     command = (
-        f'scons setconfig {build_dir} BUILD_ISA="y" '
-        f'USE_{isa}_ISA="y" RUBY="y" RUBY_PROTOCOL_{protocol}="y"'
+        f"scons setconfig {build_dir}"
+        f"{f' BUILD_ISA=y USE_{isa}_ISA=y' if isa != 'null' else ''}"
+        f"{f' RUBY=y RUBY_PROTOCOL_{protocol}=y' if protocol != 'classic' else ''}"
     )
-    if not build_args.bits_per_set is None:
+    if (not build_args.bits_per_set is None) and protocol != "classic":
         command += f" NUMBER_BITS_PER_SET={build_args.bits_per_set}"
-    if platform.machine() in kvm_support:
+    if (platform.machine() in kvm_support) and (
+        kvm_support[platform.machine()] == isa
+    ):
         command += f" USE_KVM=y KVM_ISA={kvm_support[platform.machine()]}"
     ret = [(command, gem5_dir)]
 
