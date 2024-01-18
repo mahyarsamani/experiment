@@ -12,7 +12,7 @@ from .configuration import (
     _get_automate_settings,
 )
 
-isa_translator = {"x86": "X86", "arm": "ARM", "riscv": "RISCV"}
+isa_translator = {"x86": "X86", "arm": "ARM", "riscv": "RISCV", "null": "NUll"}
 
 protocol_translator = {
     "chi": "CHI",
