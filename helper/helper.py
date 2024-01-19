@@ -237,7 +237,7 @@ def parse_command_line():
         type=str,
         help="Default isa for the project.",
         required=False,
-        choices=["x86", "arm", "riscv"],
+        choices=list(isa_translator.keys()),
     )
     init.add_argument(
         "--default-protocol",
