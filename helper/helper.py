@@ -15,11 +15,11 @@ from .configuration import (
 isa_translator = {"x86": "X86", "arm": "ARM", "riscv": "RISCV", "null": "null"}
 
 protocol_translator = {
-    "classic": "classic",
+    "classic": "CLASSIC",
     "chi": "CHI",
-    "mesi_two_level": "MESI_Two_Level",
-    "mesi_three_level": "MESI_Three_Level",
-    "mi_example": "MI_example",
+    "mesi_two_level": "MESI_TWO_LEVEL",
+    "mesi_three_level": "MESI_THREE_LEVEL",
+    "mi_example": "MI_EXAMPLE",
 }
 
 binary_opt_translator = {"debug": "debug", "opt": "opt", "fast": "fast"}
@@ -130,9 +130,9 @@ def finalize_build_args(build_args, unknown_args):
     command = (
         f"scons setconfig {build_dir}"
         f"{f' BUILD_ISA=y USE_{isa}_ISA=y' if isa != 'null' else ''}"
-        f"{f' RUBY=y RUBY_PROTOCOL_{protocol}=y' if protocol != 'classic' else ''}"
+        f"{f' RUBY=y RUBY_PROTOCOL_{protocol}=y' if protocol != 'CLASSIC' else ''}"
     )
-    if (not build_args.bits_per_set is None) and protocol != "classic":
+    if (not build_args.bits_per_set is None) and protocol != "CLASSIC":
         command += f" NUMBER_BITS_PER_SET={build_args.bits_per_set}"
     if (platform.machine() in kvm_support) and (
         kvm_support[platform.machine()] == isa
