@@ -1,9 +1,14 @@
 import os
+import re
 import json
 import shutil
+import secrets
 import argparse
 import platform
+import warnings
 import subprocess
+
+from multiprocessing import Pool
 
 from .configuration import (
     _get_project_config,
@@ -193,6 +198,178 @@ def finalize_run_args(run_args, unknown_args):
     return [(command, cwd)]
 
 
+def finalize_cook_args(cook_args, unknown_args):
+    def _parse_template(template):
+        template_def_pattern = r"^[a-zA-Z_]\w*\s*:=\s*@[a-zA-Z_]\w*$"
+        template = template.replace("{", "").replace("}", "")
+        if not re.match(template_def_pattern, template):
+            raise ValueError(
+                f"Your template definition {template} should "
+                f"match {template_def_pattern}"
+            )
+        var_name, values_name = [item.strip() for item in template.split(":=")]
+        if not values_name.startswith("@"):
+            raise ValueError(
+                "The right hand side of ':=' should start with '@'"
+            )
+        values_name = values_name.replace("@", "")
+        return var_name, values_name
+
+    def _create_input_args_as_list_string(
+        current_string: str,
+        remaining_templates: list,
+        remaining_input_space: dict,
+        input_incident: dict,
+        name: str,
+        output_templates: list,
+    ):
+        template_pattern = r"^\{.*\}$"
+        if len(remaining_templates) == 0:
+            ret = current_string
+            if not len(remaining_input_space) == 0:
+                raise ValueError(
+                    "The following input dimensions are not "
+                    "accounted for by 'input_template'. "
+                    # f"{" ".join(remaining_input_space.keys())}"
+                )
+            ret += f"--outdir={name}/"
+            if len(output_templates) == 0:
+                return [ret + f"{secrets.token_hex(12)}"]
+            else:
+                for template in output_templates:
+                    if re.match(template_pattern, template):
+                        template = template.replace("{", "").replace("}", "")
+                        if not template in input_incident:
+                            raise ValueError(
+                                f"Template token {template} not defined."
+                            )
+                        ret += f"{input_incident[template]}-"
+                    else:
+                        if not isinstance(template, str):
+                            raise ValueError(
+                                "Input template tokens "
+                                "templatized or should be a string."
+                            )
+                        ret += f"{template}-"
+                return [ret[:-1]]
+        else:
+            ret = []
+            template = remaining_templates[0]
+            if re.match(template_pattern, template):
+                var_name, values_name = _parse_template(template)
+                if not values_name in remaining_input_space.keys():
+                    raise ValueError(
+                        f"No definition for {values_name} in your recipe."
+                    )
+                values = remaining_input_space.get(values_name)
+                if not isinstance(values, list):
+                    raise ValueError(
+                        f"For now, only lists are supported for {values_name}"
+                    )
+                new_remaining_templates = remaining_templates.copy()
+                new_remaining_input_space = remaining_input_space.copy()
+                new_remaining_templates.pop(0)
+                new_remaining_input_space.pop(values_name)
+                for value in values:
+                    new_input_incident = input_incident.copy()
+                    new_input_incident[var_name] = value
+                    ret += _create_input_args_as_list_string(
+                        current_string + f"{value} ",
+                        new_remaining_templates,
+                        new_remaining_input_space,
+                        new_input_incident,
+                        name,
+                        output_templates,
+                    )
+            else:
+                if not isinstance(template, str):
+                    raise ValueError(
+                        "Input template tokens templatized or should be a string."
+                    )
+                new_remaining_templates = remaining_templates.copy()
+                new_remaining_templates.pop(0)
+                ret += _create_input_args_as_list_string(
+                    current_string + f"{template} ",
+                    new_remaining_templates,
+                    remaining_input_space,
+                    input_incident,
+                    name,
+                    output_templates,
+                )
+
+        return ret
+
+    assert cook_args.command == "cook"
+    assert len(unknown_args) == 0 or unknown_args is None
+
+    recipe = None
+    with open(cook_args.recipe, "r") as recipe_file:
+        recipe = json.load(recipe_file)
+
+    if not isinstance(recipe, dict):
+        raise ValueError(
+            "Your recipe should be expressed as a serialized dict. "
+            f"Right now your recipe is a {type(recipe)}"
+        )
+
+    if recipe is None:
+        raise ValueError(f"Failed to load your recipe at {cook_args.recipe}")
+
+    name = recipe.get("name")
+    recipe.pop("name")
+    if name is None:
+        raise ValueError(
+            "You should give your experiment a name. "
+            "Use key 'name' to define it in your recipe."
+        )
+    if not isinstance(name, str):
+        raise ValueError("'name' should be a string.")
+
+    scripts = recipe.get("scripts")
+    recipe.pop("scripts")
+    if scripts is None:
+        raise ValueError(
+            "You should specify a dictionary with paths to run scripts as the "
+            "key and as a dictionary of instructions on how to run them as "
+            "the value. Use 'scripts' as the key to define it in your recipe."
+        )
+    if not isinstance(scripts, dict):
+        raise ValueError("'scripts' should be a dictionary.")
+    # TODO: Make this more flexible
+    cwd = os.getcwd()
+    ret = [("parallel_start", "n/a")]
+    for script, instructions in scripts.items():
+        input_template = instructions.get("input_template")
+        instructions.pop("input_template")
+        if input_template is None or input_template == "":
+            warnings.warn(
+                "You have not specified an input template or your input template "
+                "is an empty string. If you don't have an input template, it "
+                "really does not make sense to use the cook command. For future "
+                "reference you can just simply use the 'run' command to run a "
+                "single simulation."
+            )
+        remaining_templates = input_template.split()
+
+        output_template = instructions.get("output_template", "")
+        if output_template != "":
+            instructions.pop("output_template")
+            output_templates = output_template.split("-")
+        if output_template == "":
+            warnings.warn(
+                "No output template specified. "
+                "Using a random hex string as the outdir."
+            )
+            output_templates = []
+
+        for item in _create_input_args_as_list_string(
+            "", remaining_templates, instructions, {}, name, output_templates
+        ):
+            ret.append((f"helper run scripts/{script} {item}", cwd))
+    ret.append(("parallel_end", "n/a"))
+    return ret
+
+
 def finalize_help_args(help_args, unknown_args):
     assert (unknown_args is None) or (len(unknown_args) == 0)
     assert help_args.command == "help"
@@ -351,6 +528,31 @@ def parse_command_line():
         required=False,
     )
 
+    cook = subparsers.add_parser(
+        "cook", description="Cook an experiment recipe."
+    )
+    cook.add_argument(
+        "recipe",
+        type=str,
+        help="Path to an experiment recipe to cook. "
+        "Supported formats are json files. "
+        "Additionally you can use our templates to templatize your recipe.",
+    )
+    cook.add_argument(
+        "--build-opt",
+        type=str,
+        help="gem5 Build option to run.",
+        required=False,
+    )
+    cook.add_argument(
+        "--override-py",
+        dest="override",
+        action="store_const",
+        const=True,
+        default=False,
+        help="Override m5 python source.",
+    )
+
     help = subparsers.add_parser("help", description="Build gem5")
     help.add_argument(
         "--build-opt",
@@ -372,6 +574,8 @@ def parse_command_line():
         recipe = finalize_build_args(known_args, unknown_args)
     elif known_args.command == "run":
         recipe = finalize_run_args(known_args, unknown_args)
+    elif known_args.command == "cook":
+        recipe = finalize_cook_args(known_args, unknown_args)
     elif known_args.command == "help":
         recipe = finalize_help_args(known_args, unknown_args)
     else:
@@ -387,12 +591,39 @@ def parse_command_line():
     return recipe
 
 
+def _run_command(cmd, cwd):
+    subprocess.run(cmd, shell=True, cwd=cwd)
+
+
 def main_function():
     recipe = parse_command_line()
-    for command, cwd in recipe:
-        print(f"Running {command} in {cwd}")
-        subprocess.run(
-            command,
-            shell=True,
-            cwd=cwd,
-        )
+    parallel_start_seen = False
+    parallel_end_seen = False
+    futures = []
+    with Pool(processes=8) as pool:
+        for command, cwd in recipe:
+            if command == "parallel_start":
+                print("Seen parallel_start.")
+                parallel_start_seen = True
+                continue
+            if command == "parallel_end":
+                print("Seen parallel_end.")
+                parallel_end_seen = True
+                for future in futures:
+                    future.get()
+                continue
+
+            if parallel_start_seen == parallel_end_seen:
+                print(f"Running {command} in {cwd}")
+                subprocess.run(
+                    command,
+                    shell=True,
+                    cwd=cwd,
+                )
+            if parallel_start_seen and not parallel_end_seen:
+                future = pool.apply_async(_run_command, [command, cwd])
+                futures.append(future)
+            if not parallel_start_seen and parallel_end_seen:
+                raise AssertionError(
+                    "parallel_end seen before parallel_start."
+                )
