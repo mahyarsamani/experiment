@@ -339,6 +339,9 @@ def finalize_cook_args(cook_args, unknown_args):
     cwd = os.getcwd()
     ret = [("parallel_start", "n/a")]
     for script, instructions in scripts.items():
+        skip = instructions.get("skip", False)
+        if skip:
+            continue
         input_template = instructions.get("input_template")
         instructions.pop("input_template")
         if input_template is None or input_template == "":
