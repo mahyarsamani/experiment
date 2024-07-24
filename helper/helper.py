@@ -150,6 +150,8 @@ def finalize_build_args(build_args, unknown_args):
         command += " --linker=gold"
     if build_args.gprof:
         command += " --gprof"
+    if build_args.no_tcmalloc:
+        command += " --without-tcmalloc"
     ret += [(command, gem5_dir)]
 
     if not build_args.no_link:
@@ -184,7 +186,7 @@ def finalize_run_args(run_args, unknown_args):
         command += f" --debug-flags={run_args.debug_flags}"
     if not run_args.debug_start is None:
         command += f" --debug-start={run_args.debug_start}"
-    if not run_args.debug_start is None:
+    if not run_args.debug_end is None:
         command += f" --debug-end={run_args.debug_end}"
     if run_args.gdb:
         command = "gdb --args " + command
@@ -227,10 +229,15 @@ def finalize_cook_args(cook_args, unknown_args):
         if len(remaining_templates) == 0:
             ret = current_string
             if not len(remaining_input_space) == 0:
-                raise ValueError(
+                # raise ValueError(
+                #     "The following input dimensions are not "
+                #     "accounted for by 'input_template'. "
+                #     f"{' '.join(remaining_input_space.keys())}"
+                # )
+                warnings.warn(
                     "The following input dimensions are not "
                     "accounted for by 'input_template'. "
-                    # f"{" ".join(remaining_input_space.keys())}"
+                    f"{' '.join(remaining_input_space.keys())}"
                 )
             ret += f"--outdir={name}/"
             if len(output_templates) == 0:
@@ -325,50 +332,129 @@ def finalize_cook_args(cook_args, unknown_args):
     if not isinstance(name, str):
         raise ValueError("'name' should be a string.")
 
-    scripts = recipe.get("scripts")
-    recipe.pop("scripts")
-    if scripts is None:
+    scripts = recipe.get("scripts", None)
+    checkpoints = recipe.get("checkpoints", None)
+
+    if scripts is None and checkpoints is None:
         raise ValueError(
             "You should specify a dictionary with paths to run scripts as the "
             "key and as a dictionary of instructions on how to run them as "
-            "the value. Use 'scripts' as the key to define it in your recipe."
+            "the value. Use 'scripts' as the key to define it in your recipe. "
+            "Alternatively you can specify checkpoints to run a simulation. "
+            "The checkpoints keyword is used to describe a dictionary of "
+            "sampled simulations to restore."
         )
-    if not isinstance(scripts, dict):
+
+    if not scripts is None and not isinstance(scripts, dict):
         raise ValueError("'scripts' should be a dictionary.")
+    if not checkpoints is None and not isinstance(checkpoints, dict):
+        raise ValueError("'checkpoints' should be a dictionary.")
+
     # TODO: Make this more flexible
     cwd = os.getcwd()
     ret = [("parallel_start", "n/a")]
-    for script, instructions in scripts.items():
-        skip = instructions.get("skip", False)
-        if skip:
-            continue
-        input_template = instructions.get("input_template")
-        instructions.pop("input_template")
-        if input_template is None or input_template == "":
-            warnings.warn(
-                "You have not specified an input template or your input template "
-                "is an empty string. If you don't have an input template, it "
-                "really does not make sense to use the cook command. For future "
-                "reference you can just simply use the 'run' command to run a "
-                "single simulation."
-            )
-        remaining_templates = input_template.split()
 
-        output_template = instructions.get("output_template", "")
-        if output_template != "":
-            instructions.pop("output_template")
-            output_templates = output_template.split("-")
-        if output_template == "":
-            warnings.warn(
-                "No output template specified. "
-                "Using a random hex string as the outdir."
+    if not scripts is None:
+        recipe.pop("scripts")
+        if scripts is None:
+            raise ValueError(
+                "You should specify a dictionary with paths to run scripts as the "
+                "key and as a dictionary of instructions on how to run them as "
+                "the value. Use 'scripts' as the key to define it in your recipe."
             )
-            output_templates = []
+        if not isinstance(scripts, dict):
+            raise ValueError("'scripts' should be a dictionary.")
 
-        for item in _create_input_args_as_list_string(
-            "", remaining_templates, instructions, {}, name, output_templates
-        ):
-            ret.append((f"helper run scripts/{script} {item}", cwd))
+        for script, instructions in scripts.items():
+            skip = instructions.get("skip", False)
+            if skip:
+                continue
+            input_template = instructions.get("input_template")
+            instructions.pop("input_template")
+            if input_template is None or input_template == "":
+                warnings.warn(
+                    "You have not specified an input template or your input template "
+                    "is an empty string. If you don't have an input template, it "
+                    "really does not make sense to use the cook command. For future "
+                    "reference you can just simply use the 'run' command to run a "
+                    "single simulation."
+                )
+            remaining_templates = input_template.split()
+
+            output_template = instructions.get("output_template", "")
+            if output_template != "":
+                instructions.pop("output_template")
+                output_templates = output_template.split("-")
+            if output_template == "":
+                warnings.warn(
+                    "No output template specified. "
+                    "Using a random hex string as the outdir."
+                )
+                output_templates = []
+
+            for item in _create_input_args_as_list_string(
+                "",
+                remaining_templates,
+                instructions,
+                {},
+                name,
+                output_templates,
+            ):
+                ret.append((f"helper run scripts/{script} {item}", cwd))
+
+    if not checkpoints is None:
+        for checkpoint, instructions in checkpoints.items():
+            scripts = instructions.get("scripts", None)
+            if scripts is None:
+                raise ValueError(
+                    "You should specify a script to run your checkpoint."
+                )
+            if not isinstance(scripts, list):
+                raise ValueError("'scripts' should be a list.")
+            suffixes = instructions.get("suffixes", None)
+            if suffixes is None:
+                raise ValueError(
+                    "You should specify suffixes to run your checkpoint."
+                )
+            if not isinstance(suffixes, list):
+                raise ValueError("'suffixes' should be a list.")
+            cmd_suffixes = instructions.get("cmd_suffixes", None)
+            if not isinstance(cmd_suffixes, list):
+                raise ValueError("'cmd_suffixes' should be a list.")
+            rep_rid = instructions.get("rep_rid", None)
+            if rep_rid is None:
+                raise ValueError(
+                    "You should specify a rep_rid to run your checkpoint."
+                )
+            try:
+                with open(rep_rid, "r") as rep_rid_file:
+                    rep_rid = json.load(rep_rid_file)
+            except FileNotFoundError:
+                raise ValueError(
+                    f"Failed to load your rep_rid at {rep_rid}. "
+                    "rep_rid should point to a json file which descibes the "
+                    "representative regions for each workload. "
+                    "Dict(workload: list(region))."
+                )
+            if not isinstance(rep_rid, dict):
+                raise ValueError(
+                    "Your rep_rid should be expressed as a serialized dict."
+                )
+            for i, script in enumerate(scripts):
+                for workload, info in rep_rid.items():
+                    regions = info["rep_rid"]
+                    if not isinstance(regions, list):
+                        raise ValueError(
+                            "Your regions should be expressed as a list."
+                        )
+                    for region in regions:
+                        ret.append(
+                            (
+                                f"helper run scripts/{script} {workload} {region} {cmd_suffixes[i]} --outdir=ckpt-{name}/{suffixes[i]}/{workload}/{region}",
+                                cwd,
+                            )
+                        )
+
     ret.append(("parallel_end", "n/a"))
     return ret
 
@@ -474,6 +560,14 @@ def parse_command_line():
         const=True,
         default=False,
         help="Whether to compile gem5 with gprof.",
+    )
+    build.add_argument(
+        "--no-tcmalloc",
+        dest="no_tcmalloc",
+        action="store_const",
+        const=True,
+        default=False,
+        help="Whether to compile gem5 without tcmalloc.",
     )
     build.add_argument(
         "--no-link",
@@ -603,7 +697,7 @@ def main_function():
     parallel_start_seen = False
     parallel_end_seen = False
     futures = []
-    with Pool(processes=8) as pool:
+    with Pool(processes=40) as pool:
         for command, cwd in recipe:
             if command == "parallel_start":
                 print("Seen parallel_start.")
