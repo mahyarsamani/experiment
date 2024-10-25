@@ -2,14 +2,6 @@ import os
 import subprocess
 
 
-def _automate_project_name():
-    print(
-        "No value set for project_name. "
-        "Setting project_name to the name of the current directory."
-    )
-    return os.path.basename(os.path.abspath(os.getcwd()))
-
-
 def _automate_gem5_dir():
     print("Nothing set for gem5_dir.")
     if not "gem5" in os.listdir(os.path.abspath(os.getcwd())):
