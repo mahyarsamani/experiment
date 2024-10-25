@@ -57,15 +57,14 @@ def parse_run_args(args):
 
 
 def finalize_run_args(run_args, unknown_args):
-    assert run_args.command == "run"
-
     configuration = _get_project_config()
 
     isa, protocol, opt = _parse_build_opt(run_args.build_opt, configuration)
     base_dir = configuration["gem5_binary_base_dir"]
-    project_name = configuration["project_name"]
 
-    command = f"{base_dir}/{project_name}/{isa.lower()}-{protocol.lower()}-{opt.lower()}/gem5.{opt}"
+    command = (
+        f"{base_dir}/{isa.lower()}-{protocol.lower()}-{opt.lower()}/gem5.{opt}"
+    )
     if not run_args.outdir is None:
         outdir_base = configuration["gem5_out_base_dir"]
         command += f" -re --outdir={outdir_base}/{run_args.outdir}"
