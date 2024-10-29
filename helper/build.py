@@ -115,7 +115,7 @@ def finalize_build_args(build_args, unknown_args):
     build_dir = os.path.join(
         current_path, f"{isa.lower()}-{protocol.lower()}-{opt.lower()}"
     )
-    build_config = os.path.join(build_dir, "gem5.build")
+    build_config = os.path.join(build_dir, "gem5.build/config")
 
     need_setconfig = False
     if os.path.exists(build_config):
@@ -134,11 +134,17 @@ def finalize_build_args(build_args, unknown_args):
 
     ret = []
     if need_setconfig:
-        command = (
-            f"scons setconfig {build_dir}"
-            f"{f' BUILD_ISA=y USE_{isa}_ISA=y' if isa != 'null' else ''}"
-            f"{f' RUBY=y RUBY_PROTOCOL_{protocol}=y' if protocol != 'CLASSIC' else ''}"
-        )
+        if protocol == "GPU_VIPER" and isa != "X86":
+            raise ValueError("viper protocol only works with x86.")
+
+        command = f"scons setconfig {build_dir}"
+        if isa != "null":
+            command += f" BUILD_ISA=y USE_{isa}_ISA=y"
+        if protocol == "GPU_VIPER":
+            command += " BUILD_GPU=y VEGA_GPU_ISA=y"
+        if protocol != "CLASSIC":
+            command += f" RUBY=y RUBY_PROTOCOL_{protocol}=y"
+
         if build_args.bits_per_set is not None:
             if protocol == "CLASSIC":
                 raise ValueError(

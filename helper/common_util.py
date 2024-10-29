@@ -6,6 +6,7 @@ protocol_translator = {
     "mesi_two_level": "MESI_TWO_LEVEL",
     "mesi_three_level": "MESI_THREE_LEVEL",
     "mi_example": "MI_EXAMPLE",
+    "viper": "GPU_VIPER",
 }
 
 binary_opt_translator = {"debug": "debug", "opt": "opt", "fast": "fast"}
