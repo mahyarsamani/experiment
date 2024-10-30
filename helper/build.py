@@ -120,7 +120,7 @@ def finalize_build_args(build_args, unknown_args):
     need_setconfig = False
     if os.path.exists(build_config):
         print(f"Path {build_config} already exists.")
-        old_config = _get_config_as_namespace(f"{build_config}/config")
+        old_config = _get_config_as_namespace(f"{build_config}")
         if (
             build_args.bits_per_set is not None
             and old_config.bits_per_set != build_args.bits_per_set
