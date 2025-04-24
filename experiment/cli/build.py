@@ -1,11 +1,10 @@
-from .common_util import _parse_build_opt, kvm_support
-from .configuration import _get_project_config
+from ..util.common_util import _parse_build_opt, kvm_support
+from ..util.configuration import _get_project_config
 
 import argparse
 import os
 import platform
 import re
-import shutil
 
 from types import SimpleNamespace
 
@@ -23,6 +22,13 @@ def parse_build_args(args):
         type=int,
         help="Number of threads to use to build gem5.",
         required=False,
+    )
+    parser.add_argument(
+        "--build-name",
+        type=str,
+        required=False,
+        default="release",
+        help="Build name to use for gem5 compilation.",
     )
     parser.add_argument(
         "--bits-per-set",
@@ -95,7 +101,6 @@ def finalize_build_args(build_args, unknown_args):
         threads = build_args.threads
 
     gem5_dir = configuration["gem5_dir"]
-    project_name = configuration["project_name"]
     base_dir = configuration["gem5_binary_base_dir"]
 
     path_parts = base_dir.split("/")[1:]
@@ -113,7 +118,8 @@ def finalize_build_args(build_args, unknown_args):
         current_path = test_path
 
     build_dir = os.path.join(
-        current_path, f"{isa.lower()}-{protocol.lower()}-{opt.lower()}"
+        current_path,
+        f"{isa.lower()}-{protocol.lower()}-{opt.lower()}-{build_args.build_name}",
     )
     build_config = os.path.join(build_dir, "gem5.build/config")
 

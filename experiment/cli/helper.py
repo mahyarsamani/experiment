@@ -6,8 +6,8 @@ def parse_command_line():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(help="sub-command help", dest="command")
     init = subparsers.add_parser("init", description="Initiate a project.")
-    build = subparsers.add_parser("build", description="Build gem5")
-    run = subparsers.add_parser("run", description="Run gem5")
+    build = subparsers.add_parser("build", description="Build gem5.")
+    run = subparsers.add_parser("run", description="Run gem5.")
 
     parsed_args, for_subparser = parser.parse_known_args()
     if parsed_args.command == "init":

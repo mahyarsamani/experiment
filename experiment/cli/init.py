@@ -1,9 +1,9 @@
-from .common_util import (
+from ..util.common_util import (
     binary_opt_translator,
     isa_translator,
     protocol_translator,
 )
-from .configuration import (
+from ..util.configuration import (
     _get_automate_settings,
     _get_default_settings,
     _get_settings_list,
