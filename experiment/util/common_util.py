@@ -8,6 +8,7 @@ protocol_translator = {
     "mi_example": "MI_EXAMPLE",
     "garnet": "GARNET_STANDALONE",
     "viper": "GPU_VIPER",
+    "cxl": "CXL",
 }
 
 binary_opt_translator = {"debug": "debug", "opt": "opt", "fast": "fast"}
