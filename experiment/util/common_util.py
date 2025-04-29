@@ -3,8 +3,8 @@ isa_translator = {"x86": "X86", "arm": "ARM", "riscv": "RISCV", "null": "null"}
 protocol_translator = {
     "classic": "CLASSIC",
     "chi": "CHI",
-    "mesi2": "MESI_TWO_LEVEL",
-    "mesi3": "MESI_THREE_LEVEL",
+    "mesi2": "MESI_Two_Level",
+    "mesi3": "MESI_Three_Level",
     "viper": "GPU_VIPER",
     "cxl": "CXL",
 }
