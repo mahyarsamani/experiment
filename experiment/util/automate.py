@@ -12,3 +12,11 @@ def _automate_gem5_dir():
     else:
         print("Found gem5 director in the current directory.")
     return os.path.join(os.path.abspath(os.getcwd()), "gem5")
+
+
+def _automate_default_threads():
+    print("Nothing set for default_threads.")
+    print("Setting default_threads to 7/8 of the available cores.")
+    threads = int(os.cpu_count() * 7 / 8) or 1
+    print(f"Setting default_threads to {threads}.")
+    return threads

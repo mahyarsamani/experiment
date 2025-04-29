@@ -5,5 +5,8 @@
   "default_protocol",
   "gem5_dir",
   "gem5_out_base_dir",
-  "gem5_binary_base_dir"
+  "gem5_binary_base_dir",
+  "default_threads",
+  "default_linker",
+  "gem5_resource_json"
 ]

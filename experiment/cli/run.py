@@ -65,6 +65,12 @@ def parse_run_args(args):
         required=False,
         help="Path to custom gdb init file if any.",
     )
+    parser.add_argument(
+        "--gem5-resource-json",
+        type=str,
+        required=False,
+        help="Path to the gem5 resource JSON file.",
+    )
 
     return parser.parse_known_args(args)
 
@@ -78,10 +84,13 @@ def finalize_run_args(run_args, unknown_args):
     _check_arg_dependencies(run_args)
     configuration = _get_project_config()
 
-    isa, protocol, opt = _parse_build_opt(run_args.build_opt, configuration)
+    isas, protocols, opt = _parse_build_opt(run_args.build_opt, configuration)
     base_dir = configuration["gem5_binary_base_dir"]
 
-    command = f"{base_dir}/{isa.lower()}-{protocol.lower()}-{opt.lower()}-{run_args.build_name}/gem5.{opt}"
+    isas_str = ("_and_".join(isas)).lower()
+    protocols_str = ("_and_".join(protocols)).lower()
+    opt_str = ("".join(opt)).lower()
+    command = f"{base_dir}/{isas_str}-{protocols_str}-{opt_str}-{run_args.build_name}/gem5.{opt_str}"
     if not run_args.outdir is None:
         outdir_base = configuration["gem5_out_base_dir"]
         command += f" -re --outdir={outdir_base}/{run_args.outdir}"
@@ -98,6 +107,17 @@ def finalize_run_args(run_args, unknown_args):
             command = f"gdb --args {command}"
     if run_args.override:
         command = "M5_OVERRIDE_PY_SOURCE=true " + command
+    if run_args.gem5_resource_json is not None:
+        command = (
+            f"GEM5_RESOURCE_JSON_APPEND={run_args.gem5_resource_json} "
+            + command
+        )
+    else:
+        if configuration["gem5_resource_json"] != "":
+            command = (
+                f"GEM5_RESOURCE_JSON_APPEND={configuration['gem5_resource_json']} "
+                + command
+            )
     command += f" {run_args.config}"
     for unknown_arg in unknown_args:
         command += f" {unknown_arg}"

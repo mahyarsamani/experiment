@@ -37,12 +37,10 @@ def parse_build_args(args):
         required=False,
     )
     parser.add_argument(
-        "--gold",
-        dest="gold",
-        action="store_const",
-        const=True,
-        default=False,
-        help="Enable linking with gold instead of ld.",
+        "--linker",
+        type=str,
+        help="Linker to use when building gem5.",
+        required=False,
     )
     parser.add_argument(
         "--gprof",
@@ -89,16 +87,23 @@ def finalize_build_args(build_args, unknown_args):
 
     configuration = _get_project_config()
 
-    isa, protocol, opt = _parse_build_opt(build_args.build_opt, configuration)
+    isas, protocols, opt = _parse_build_opt(
+        build_args.build_opt, configuration
+    )
 
     if build_args.threads is None:
         print(
-            f"Number of threads not specified. "
-            "Using 7/8 of available cores by default."
+            f"Number of threads not specified. Using default number of threads."
         )
-        threads = int(os.cpu_count() * 7 / 8) or 1
+        threads = configuration["default_threads"]
     else:
         threads = build_args.threads
+
+    if build_args.linker is None:
+        print(f"Linker not specified. Using default linker.")
+        linker = configuration["default_linker"]
+    else:
+        linker = build_args.linker
 
     gem5_dir = configuration["gem5_dir"]
     base_dir = configuration["gem5_binary_base_dir"]
@@ -117,21 +122,31 @@ def finalize_build_args(build_args, unknown_args):
             print(f"Path {test_path} already exists.")
         current_path = test_path
 
+    isas_str = ("_and_".join(isas)).lower()
+    protocols_str = ("_and_".join(protocols)).lower()
+    opt_str = ("".join(opt)).lower()
     build_dir = os.path.join(
         current_path,
-        f"{isa.lower()}-{protocol.lower()}-{opt.lower()}-{build_args.build_name}",
+        f"{isas_str}-{protocols_str}-{opt_str}-{build_args.build_name}",
     )
     build_config = os.path.join(build_dir, "gem5.build/config")
 
     need_setconfig = False
     if os.path.exists(build_config):
         print(f"Path {build_config} already exists.")
-        old_config = _get_config_as_namespace(f"{build_config}")
-        if (
-            build_args.bits_per_set is not None
-            and old_config.bits_per_set != build_args.bits_per_set
-        ):
-            print("Bits per set changed. Need to setconfig.")
+        try:
+            old_config = _get_config_as_namespace(f"{build_config}")
+            if (
+                build_args.bits_per_set is not None
+                and old_config.bits_per_set != build_args.bits_per_set
+            ):
+                print("Bits per set changed. Need to setconfig.")
+                need_setconfig = True
+        except Exception as e:
+            print(
+                f"Caught exception: {e}. There's probably "
+                "something wrong with the config. Redoing the config."
+            )
             need_setconfig = True
     else:
         print(f"Path {build_config} does not exist.")
@@ -140,32 +155,44 @@ def finalize_build_args(build_args, unknown_args):
 
     ret = []
     if need_setconfig:
-        if protocol == "GPU_VIPER" and isa != "X86":
+        if "GPU_VIPER" in protocols and "X86" not in isas:
             raise ValueError("viper protocol only works with x86.")
 
         command = f"scons setconfig {build_dir}"
-        if isa != "null":
-            command += f" BUILD_ISA=y USE_{isa}_ISA=y"
-        if protocol == "GPU_VIPER":
-            command += " BUILD_GPU=y VEGA_GPU_ISA=y"
-        if protocol != "CLASSIC":
-            command += f" RUBY=y RUBY_PROTOCOL_{protocol}=y"
+        if "null" in isas and len(isas) > 1:
+            raise ValueError(
+                "Null ISA cannot be used with other ISAs. Please use only null ISA."
+            )
+        else:
+            command += f" BUILD_ISA=y "
+            command += " ".join([f"USE_{isa}_ISA=y" for isa in isas])
+
+        if "CLASSIC" in protocols:
+            protocols.remove("CLASSIC")
+        if len(protocols) > 0:
+            command += " RUBY=y "
+        if len(protocols) > 1:
+            command += 'USE_MULTIPLE_PROTOCOLS=y PROTOCOL="MULTIPLE" '
+        if "GPU_VIPER" in protocols:
+            command += "BUILD_GPU=y VEGA_GPU_ISA=y "
+        command += " ".join(
+            [f"RUBY_PROTOCOL_{protocol}=y" for protocol in protocols]
+        )
 
         if build_args.bits_per_set is not None:
-            if protocol == "CLASSIC":
+            if len(protocols) == 0:
                 raise ValueError(
-                    f"`bits_per_set` defined with classic coherency protocol."
+                    "`bits_per_set` defined without any ruby protocol."
                 )
             command += f" NUMBER_BITS_PER_SET={build_args.bits_per_set}"
         if (platform.machine() in kvm_support) and (
-            kvm_support[platform.machine()] == isa
+            kvm_support[platform.machine()] in isas
         ):
             command += f" USE_KVM=y KVM_ISA={kvm_support[platform.machine()]}"
         ret += [(command, gem5_dir)]
 
-    command = f"scons -C {gem5_dir} gem5.{opt} -j {threads}"
-    if build_args.gold:
-        command += " --linker=gold"
+    command = f"scons -C {gem5_dir} gem5.{opt} -j {threads} --linker={linker}"
+
     if build_args.gprof:
         command += " --gprof"
     if build_args.no_tcmalloc:

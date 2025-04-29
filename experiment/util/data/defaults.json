@@ -1,5 +1,7 @@
 {
-  "default_isa": "arm",
+  "default_isa": ["arm"],
   "default_binary_opt": "fast",
-  "default_protocol": "chi"
+  "default_protocol": ["chi"],
+  "default_linker": "gold",
+  "gem5_resource_json": ""
 }

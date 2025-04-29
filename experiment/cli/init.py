@@ -39,17 +39,15 @@ def parse_init_args(args):
     )
     parser.add_argument(
         "--default-isa",
-        type=str,
+        type=lambda s: [str(elem) for elem in s.split(",")],
         help="Default isa for the project.",
         required=False,
-        choices=list(isa_translator.keys()),
     )
     parser.add_argument(
         "--default-protocol",
-        type=str,
+        type=lambda s: [str(elem) for elem in s.split(",")],
         help="Default protocol for the project.",
         required=False,
-        choices=list(protocol_translator.keys()),
     )
     parser.add_argument(
         "--default-binary-opt",
@@ -57,6 +55,25 @@ def parse_init_args(args):
         help="Default binary option to use.",
         required=False,
         choices=list(binary_opt_translator.keys()),
+    )
+    parser.add_argument(
+        "--default-threads",
+        type=int,
+        help="Default number of threads to use to build gem5.",
+        required=False,
+    )
+    parser.add_argument(
+        "--default-linker",
+        type=str,
+        help="Default linker to use when building gem5.",
+        required=False,
+        choices=["bfd", "gold", "lld", "mold"],
+    )
+    parser.add_argument(
+        "--gem5-resource-json",
+        type=str,
+        required=False,
+        help="Path to the gem5 resource JSON file.",
     )
 
     return parser.parse_known_args(args)
@@ -71,7 +88,7 @@ def finalize_init_args(init_args, unknown_args):
     automate = _get_automate_settings()
 
     for setting in settings:
-        if not getattr(init_args, setting) is None:
+        if getattr(init_args, setting) is not None:
             configuration[setting] = getattr(init_args, setting)
         elif setting in defaults:
             print(
