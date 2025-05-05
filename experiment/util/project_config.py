@@ -2,6 +2,7 @@ from .defaults import config_file_name, gem5_repo_url
 
 import json
 import os
+import pkg_resources
 import platform
 import shutil
 import subprocess
@@ -353,6 +354,25 @@ class PathConfiguration:
 
     def initialize_directories(self, config_dict: Dict):
         self.project_dir.mkdir(parents=True, exist_ok=True)
+
+        components_dir = self.project_dir / "components"
+        components_dir.mkdir(parents=True, exist_ok=True)
+        (components_dir / "__init__.py").touch(exist_ok=True)
+
+        scripts_dir = self.project_dir / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / "util").mkdir(parents=True, exist_ok=True)
+        (scripts_dir / "util" / "__init__.py").touch(exist_ok=True)
+
+        if not (scripts_dir / "util" / "runnable.py").exists():
+            runnable_py = pkg_resources.resource_filename(
+                "experiment.api", "assets/runnable.py"
+            )
+            shutil.copy(
+                runnable_py,
+                scripts_dir / "util" / "runnable.py",
+            )
+
         if not self.gem5_source_dir.exists():
             self.gem5_source_dir.mkdir(parents=True, exist_ok=True)
             warn(
