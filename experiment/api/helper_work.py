@@ -3,7 +3,6 @@ from .job import Job
 
 from enum import Enum
 from pathlib import Path
-from typing import List
 
 
 class OtherValues(Enum):
@@ -22,10 +21,15 @@ class HelperJob(Job):
         *args,
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
+        super().__init__()
+        self._partial_command = self._build_partial_command(
+            run_script_path, *args, **kwargs
+        )
         self._run_script_path = run_script_path
+        self._args = args
+        self._kwargs = kwargs
 
-    def _build_partial_command(self, *args, **kwargs) -> str:
+    def _build_partial_command(self, run_script_path, *args, **kwargs) -> str:
         positional_args = " ".join(map(str, args))
         keyword_items = []
         for key, value in kwargs.items():
@@ -34,21 +38,7 @@ class HelperJob(Job):
             else:
                 keyword_items += [f"--{key.replace('_', '-')} {value}"]
         keyword_args = " ".join(keyword_items)
-        return (
-            f"{self._run_script_path} {positional_args} {keyword_args}".strip()
-        )
-
-    def command(self):
-        return self._command
-
-    def __hash__(self):
-        return hash(self._command)
-
-    def __str__(self):
-        return f"Job(command={self._command})"
-
-    def __repr__(self):
-        return self.__str__()
+        return f"{run_script_path} {positional_args} {keyword_args}".strip()
 
 
 class HelperExperiment(Experiment):
@@ -56,14 +46,19 @@ class HelperExperiment(Experiment):
         super().__init__(name)
         self._project_dir = project_dir
 
-    def get_project_dir(self) -> str:
-        return str(self._project_dir)
+    def get_project_dir(self) -> Path:
+        return self._project_dir
 
-    def get_python_path(self) -> str:
-        return str(self._project_dir / "env" / "bin" / "python")
+    def get_env_path(self) -> Path:
+        return self.get_project_dir() / "env"
 
-    def _complete_partial_job(self, job):
-        job.set_full_command(
+    def _register_job(self, job):
+        if not isinstance(job, HelperJob):
+            raise RuntimeError("Job is not a HelperJob.")
+
+        job.set_command(
             f"helper run --build-name {self._name} "
             f"--outdir={self._name}/{job.id()} {job.partial_command()}"
         )
+        job.set_cwd(self.get_project_dir())
+        job.set_env_path(self.get_env_path())

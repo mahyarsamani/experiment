@@ -1,25 +1,46 @@
-from ..util.common_util import _parse_build_opt
-from ..util.configuration import _get_project_config
+from ..util.config_util import _get_project_config
+from ..util.project_config import (
+    BinaryOpt,
+    CompileConfiguration,
+    ISA,
+    Linker,
+    PathConfiguration,
+    Protocol,
+)
 
 import argparse
-import os
+import subprocess
 
 
 def parse_run_args(args):
     parser = argparse.ArgumentParser("Parse run command from helper.")
     parser.add_argument("config", type=str, help="Config script to simulate.")
     parser.add_argument(
-        "--build-opt",
+        "--build-name",
         type=str,
-        help="gem5 Build option to run.",
+        help="Build name to use for gem5 compilation.",
         required=False,
     )
     parser.add_argument(
-        "--build-name",
+        "--isas",
         type=str,
+        help="Comma separated list of isas to compile by default. "
+        f"Choose from: {ISA.return_all_values()}",
         required=False,
-        default="release",
-        help="Build name to use for gem5 compilation.",
+    )
+    parser.add_argument(
+        "--protocols",
+        type=str,
+        help="Comma separated list of isas to compile by default. "
+        f"Choose from: {Protocol.return_all_values()}",
+        required=False,
+    )
+    parser.add_argument(
+        "--binary_opt",
+        type=str,
+        help="Default binary option to use when compiling.",
+        choices=BinaryOpt.return_all_values(),
+        required=False,
     )
     parser.add_argument(
         "--outdir", type=str, help="gem5's output directory.", required=False
@@ -44,14 +65,6 @@ def parse_run_args(args):
         required=False,
     )
     parser.add_argument(
-        "--override-py",
-        dest="override",
-        action="store_const",
-        const=True,
-        default=False,
-        help="Override m5 python source.",
-    )
-    parser.add_argument(
         "--with-gdb",
         dest="gdb",
         action="store_const",
@@ -60,14 +73,23 @@ def parse_run_args(args):
         help="Run with gdb.",
     )
     parser.add_argument(
-        "--gdb-init",
+        "--gdbinit",
         type=str,
         required=False,
         help="Path to custom gdb init file if any.",
     )
     parser.add_argument(
+        "--override-py",
+        dest="override",
+        action="store_const",
+        const=True,
+        default=False,
+        help="Override m5 python source.",
+    )
+    parser.add_argument(
         "--gem5-resource-json",
         type=str,
+        default="/dev/null",
         required=False,
         help="Path to the gem5 resource JSON file.",
     )
@@ -75,25 +97,37 @@ def parse_run_args(args):
     return parser.parse_known_args(args)
 
 
-def _check_arg_dependencies(run_args):
-    if run_args.gdb_init is not None and not run_args.gdb:
-        raise ValueError("gdb-init requires --with-gdb flag.")
-
-
 def finalize_run_args(run_args, unknown_args):
+    def _check_arg_dependencies(run_args):
+        if run_args.gdbinit is not None and not run_args.gdb:
+            raise ValueError("gdb-init requires --with-gdb flag.")
+
     _check_arg_dependencies(run_args)
-    configuration = _get_project_config()
+    proj_config = _get_project_config()
+    compile_config = CompileConfiguration.from_args_and_config(
+        run_args, proj_config.compile_config
+    )
+    path_config = PathConfiguration.from_args_and_config(
+        run_args, proj_config.path_config
+    )
 
-    isas, protocols, opt = _parse_build_opt(run_args.build_opt, configuration)
-    base_dir = configuration["gem5_binary_base_dir"]
+    build_dir = (
+        path_config.gem5_binary_base_dir
+        / compile_config.make_build_dir_name(run_args)
+    )
+    gem5_path = build_dir / f"gem5.{compile_config.binary_opt}"
+    if not gem5_path.exists():
+        raise FileNotFoundError(
+            f"gem5 binary not found at {gem5_path}. "
+            "Please run the build command first."
+        )
 
-    isas_str = ("_and_".join(isas)).lower()
-    protocols_str = ("_and_".join(protocols)).lower()
-    opt_str = ("".join(opt)).lower()
-    command = f"{base_dir}/{isas_str}-{protocols_str}-{opt_str}-{run_args.build_name}/gem5.{opt_str}"
+    command = f"{gem5_path}"
     if not run_args.outdir is None:
-        outdir_base = configuration["gem5_out_base_dir"]
-        command += f" -re --outdir={outdir_base}/{run_args.outdir}"
+        outdir = (
+            proj_config.path_config.gem5_out_base_dir / f"{run_args.outdir}"
+        )
+        command += f" -re --outdir={outdir}"
     if not run_args.debug_flags is None:
         command += f" --debug-flags={run_args.debug_flags}"
     if not run_args.debug_start is None:
@@ -105,23 +139,16 @@ def finalize_run_args(run_args, unknown_args):
             command = f"gdb -x {run_args.gdb_init} --args {command}"
         else:
             command = f"gdb --args {command}"
-    if run_args.override:
-        command = "M5_OVERRIDE_PY_SOURCE=true " + command
-    if run_args.gem5_resource_json is not None:
+    if path_config.gem5_resource_json_path != PathConfiguration.NULL_PATH:
         command = (
-            f"GEM5_RESOURCE_JSON_APPEND={run_args.gem5_resource_json} "
+            f"GEM5_RESOURCE_JSON_APPEND={path_config.gem5_resource_json_path} "
             + command
         )
-    else:
-        if configuration["gem5_resource_json"] != "":
-            command = (
-                f"GEM5_RESOURCE_JSON_APPEND={configuration['gem5_resource_json']} "
-                + command
-            )
+    if run_args.override:
+        command = "M5_OVERRIDE_PY_SOURCE=true " + command
+
     command += f" {run_args.config}"
     for unknown_arg in unknown_args:
         command += f" {unknown_arg}"
 
-    cwd = os.path.abspath(os.getcwd())
-
-    return [(command, cwd)]
+    subprocess.run(["bash", "-c", command], cwd=path_config.project_dir)

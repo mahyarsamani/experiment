@@ -1,32 +1,73 @@
 import hashlib
 
+from pathlib import Path
+
 
 class Job:
-    def __init__(
-        self,
-        *args,
-        **kwargs,
-    ):
-        self._partial_command = self._build_partial_command(*args, **kwargs)
+    def __init__(self) -> None:
+        self._partial_command = None
         self._command = None
+        self._cwd = None
+        self._env_path = None
+        self._id = None
 
-    def _build_partial_command(self, *args, **kwargs) -> str:
-        raise NotImplementedError
+    def set_partial_command(self, partial_command: str) -> None:
+        self._partial_command = partial_command
 
-    def partial_command(self):
-        return self._command
+    def partial_command(self) -> str:
+        if self._partial_command is None:
+            raise RuntimeError("Partial command has not been set.")
+        return self._partial_command
 
-    def set_full_command(self, command):
+    def set_command(self, command: str) -> None:
         self._command = command
 
-    def command(self):
+    def command(self) -> str:
         if self._command is None:
             raise RuntimeError("Command has not been set.")
         return self._command
 
-    def id(self):
-        hash_object = hashlib.sha256(self._partial_command.encode())
-        return hash_object.hexdigest()
+    def set_cwd(self, cwd: Path) -> None:
+        self._cwd = cwd.resolve()
+
+    def cwd(self) -> Path:
+        if self._cwd is None:
+            raise RuntimeError("CWD has not been set.")
+        return self._cwd
+
+    def set_env_path(self, env_path: Path) -> None:
+        self._env_path = env_path.resolve()
+
+    def env_path(self) -> Path:
+        if self._env_path is None:
+            raise RuntimeError("Env path has not been set.")
+        return self._env_path
+
+    def id(self) -> str:
+        if self._id is None:
+            self._id = hashlib.sha256(
+                self._partial_command.encode()
+            ).hexdigest()
+        return self._id
+
+    def serialize(self) -> dict:
+        return {
+            "_partial_command": self._partial_command,
+            "_command": self._command,
+            "_cwd": str(self._cwd),
+            "_env_path": str(self._env_path),
+            "_id": self._id,
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "Job":
+        job = cls()
+        job._partial_command = data["_partial_command"]
+        job._command = data["_command"]
+        job._cwd = Path(data["_cwd"])
+        job._env_path = Path(data["_env_path"])
+        job._id = data["_id"]
+        return job
 
     def __hash__(self):
         return hash(self._command)

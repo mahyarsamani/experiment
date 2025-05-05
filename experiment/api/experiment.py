@@ -1,6 +1,7 @@
 from .job import Job
 
 from typing import List
+from warnings import warn
 
 
 class Experiment:
@@ -8,13 +9,13 @@ class Experiment:
         self._name = name
         self._jobs = list()
 
-    def _complete_partial_job(self, job: Job) -> None:
+    def _register_job(self, job: Job) -> None:
         raise NotImplementedError
 
-    def create_job(self, *args, **kwargs) -> None:
-        new_job = Job(*args, **kwargs)
-        self._complete_partial_job(new_job)
-        self._jobs.append(new_job)
+    def register_job(self, job: Job) -> None:
+        self._register_job(job)
+        self._jobs.append(job)
+        warn(f"Registered job: {job.id()}")
 
     def get_jobs(self) -> List[Job]:
         return self._jobs
