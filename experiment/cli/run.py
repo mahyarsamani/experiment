@@ -9,6 +9,7 @@ from ..util.project_config import (
 )
 
 import argparse
+import os
 import subprocess
 
 
@@ -151,4 +152,7 @@ def finalize_run_args(run_args, unknown_args):
     for unknown_arg in unknown_args:
         command += f" {unknown_arg}"
 
-    subprocess.run(["bash", "-c", command], cwd=path_config.project_dir)
+    subprocess.run(
+        ["bash", "-c", command],
+        cwd=path_config.project_dir,
+    )

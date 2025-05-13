@@ -1,6 +1,6 @@
 import argparse
 
-from experiment.api.decorators import expose_prject_dir, record_args
+from util.decorators import expose_prject_dir, record_args
 
 
 @expose_prject_dir
@@ -26,8 +26,11 @@ def run_example(num_generator_cores):
     from gem5.simulate.simulator import Simulator
 
     board = TestBoard(
+        clk_freq="1GHz",
         generator=LinearGenerator(num_cores=num_generator_cores),
-        cache_hierarchy=PrivateL1SharedL2CacheHierarchy(),
+        cache_hierarchy=PrivateL1SharedL2CacheHierarchy(
+            l1d_size="32KiB", l1i_size="32KiB", l2_size="512KiB"
+        ),
         memory=DualChannelDDR4_2400(),
     )
 
@@ -47,6 +50,7 @@ def get_inputs():
 
     args = parser.parse_args()
     return [args.num_generator_cores]
+
 
 if __name__ == "__m5_main__":
     run_example(*get_inputs())

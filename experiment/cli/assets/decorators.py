@@ -3,12 +3,10 @@ import sys
 
 from pathlib import Path
 
-from ..util.config_util import _get_project_config
-
 
 def expose_prject_dir(run):
     def wrapper(*args, **kwargs):
-        proj_dir = _get_project_config().path_config.project_dir
+        proj_dir = Path(__file__).resolve().parent.parent
         sys.path.append(proj_dir)
 
         run(*args, **kwargs)
