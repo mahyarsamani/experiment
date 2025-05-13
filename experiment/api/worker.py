@@ -9,6 +9,9 @@ from .job import Job
 
 
 class Worker(Service):
+    def __init__(self):
+        self._processes = dict()
+
     def on_connect(self, conn):
         print("Client connected")
 
@@ -16,10 +19,18 @@ class Worker(Service):
         print("Client disconnected")
 
     def exposed_is_running(self, pid: int) -> bool:
-        try:
-            process = psutil.Process(pid)
+        assert pid in self._processes, "PID not found in the process list"
+
+        process = self._processes[pid]
+
+        if process.status() == psutil.STATUS_ZOMBIE:
+            process.poll()
+            return False
+        else:
             return process.is_running()
+
         except psutil.NoSuchProcess:
+            # Might be a zombie we didn't track
             return False
 
     def exposed_launch_job(
@@ -57,4 +68,5 @@ class Worker(Service):
                 env=env,
                 start_new_session=True,
             )
+        self._processes[proc.pid] = proc
         return proc.pid

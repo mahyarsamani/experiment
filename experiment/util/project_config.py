@@ -355,22 +355,37 @@ class PathConfiguration:
     def initialize_directories(self, config_dict: Dict):
         self.project_dir.mkdir(parents=True, exist_ok=True)
 
+        warn(
+            "Creating `components` and `scripts` directories. "
+            "I recommend to put all the components you build "
+            "(e.g. cache hierarchies, processors, memories, boards, etc.) "
+            "in the `components` directory. I also recommend to put all your "
+            "run_scripts in `scripts` directory. I have found this to be a"
+            "good practice. Additionally, I recommend using two decorators "
+            "to expose the project directory and record the arguments you pass"
+            "to the run function. Import them like below:\n"
+            "from experiment.api.decorators import expose_prject_dir, "
+            "record_args\nI also will put an example in scripts directory that"
+            "uses traffic generators with all the decorators."
+        )
         components_dir = self.project_dir / "components"
         components_dir.mkdir(parents=True, exist_ok=True)
         (components_dir / "__init__.py").touch(exist_ok=True)
 
         scripts_dir = self.project_dir / "scripts"
         scripts_dir.mkdir(parents=True, exist_ok=True)
-        (scripts_dir / "util").mkdir(parents=True, exist_ok=True)
-        (scripts_dir / "util" / "__init__.py").touch(exist_ok=True)
 
-        if not (scripts_dir / "util" / "runnable.py").exists():
-            runnable_py = pkg_resources.resource_filename(
-                "experiment.api", "assets/runnable.py"
+        if (scripts_dir / "run_example.py").exists():
+            warn(
+                "`run_example.py` already exists. I am not going to overwrite it."
+            )
+        else:
+            example_py = pkg_resources.resource_filename(
+                "experiment.api", "assets/run_example.py"
             )
             shutil.copy(
-                runnable_py,
-                scripts_dir / "util" / "runnable.py",
+                example_py,
+                scripts_dir / "run_example.py",
             )
 
         if not self.gem5_source_dir.exists():

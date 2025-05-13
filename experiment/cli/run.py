@@ -135,8 +135,8 @@ def finalize_run_args(run_args, unknown_args):
     if not run_args.debug_end is None:
         command += f" --debug-end={run_args.debug_end}"
     if run_args.gdb:
-        if run_args.gdb_init is not None:
-            command = f"gdb -x {run_args.gdb_init} --args {command}"
+        if run_args.gdbinit is not None:
+            command = f"gdb -x {run_args.gdbinit} --args {command}"
         else:
             command = f"gdb --args {command}"
     if path_config.gem5_resource_json_path != PathConfiguration.NULL_PATH:
