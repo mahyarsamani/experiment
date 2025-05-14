@@ -6,8 +6,8 @@ from pathlib import Path
 
 def expose_prject_dir(run):
     def wrapper(*args, **kwargs):
-        proj_dir = Path(__file__).resolve().parent.parent
-        sys.path.append(proj_dir)
+        proj_dir = Path(__file__).resolve().parent.parent.parent
+        sys.path.append(proj_dir.as_posix())
 
         run(*args, **kwargs)
 
