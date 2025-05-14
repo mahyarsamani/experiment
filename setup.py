@@ -3,6 +3,7 @@ from setuptools import setup, find_packages
 setup(
     name="experiment",
     version="0.9.5",
+    license="MIT",
     description="Experimentation tooling for gem5",
     author="Mahyar Samani",
     author_email="msamani@ucdavis.edu",
@@ -14,3 +15,4 @@ setup(
     },
     install_requires=["gitpython", "rpyc", "setuptools"],
 )
+
