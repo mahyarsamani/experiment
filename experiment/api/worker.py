@@ -29,10 +29,6 @@ class Worker(Service):
         else:
             return process.is_running()
 
-        except psutil.NoSuchProcess:
-            # Might be a zombie we didn't track
-            return False
-
     def exposed_launch_job(
         self,
         serialized_job: dict,
@@ -46,7 +42,7 @@ class Worker(Service):
             env["PATH"] = f"{job.env_path()}/bin:" + env["PATH"]
 
         if debug:
-            with open(f"{job.cwd()}/" "stdout.log", "a") as stdout_log, open(
+            with open(f"{job.cwd()}/stdout.log", "a") as stdout_log, open(
                 f"{job.cwd()}/stderr.log", "a"
             ) as stderr_log:
                 proc = subprocess.Popen(
