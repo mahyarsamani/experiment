@@ -13,6 +13,5 @@ setup(
     entry_points={
         "console_scripts": ["helper = experiment.cli.helper:main_function"]
     },
-    install_requires=["gitpython", "rpyc", "setuptools"],
+    install_requires=["gitpython", "rpyc", "setuptools", "psutil"],
 )
-
