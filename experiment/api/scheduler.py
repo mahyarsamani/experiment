@@ -43,11 +43,11 @@ class Scheduler:
                 connection = self._host_connections[host]
                 active_jobs = self._host_info[host.name()]["active_jobs"]
                 inactive_jobs = self._host_info[host.name()]["inactive_jobs"]
-                for pid, job in active_jobs:
+                for pid, job_cmd in active_jobs:
                     running = connection.root.is_running(pid)
                     if not running:
-                        inactive_jobs.append((pid, job.command()))
-                        active_jobs.remove((pid, job.command()))
+                        inactive_jobs.append((pid, job_cmd))
+                        active_jobs.remove((pid, job_cmd))
                         num_active_jobs -= 1
                 for _ in range(
                     min(

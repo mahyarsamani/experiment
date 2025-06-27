@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="experiment",
-    version="0.10",
+    version="0.11",
     license="MIT",
     description="Experimentation tooling for gem5",
     author="Mahyar Samani",
