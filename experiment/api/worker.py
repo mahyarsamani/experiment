@@ -21,13 +21,15 @@ class Worker(Service):
     def exposed_is_running(self, pid: int) -> bool:
         assert pid in self._processes, "PID not found in the process list"
 
-        process = self._processes[pid]
-
-        if process.status() == psutil.STATUS_ZOMBIE:
-            process.poll()
+        try:
+            ps_proc = psutil.Process(pid)
+            if ps_proc.status() == psutil.STATUS_ZOMBIE:
+                self._processes[pid].poll()
+                return False
+            else:
+                return ps_proc.is_running()
+        except psutil.NoSuchProcess:
             return False
-        else:
-            return process.is_running()
 
     def exposed_launch_job(
         self,
