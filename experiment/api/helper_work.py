@@ -42,9 +42,10 @@ class HelperJob(Job):
 
 
 class HelperExperiment(Experiment):
-    def __init__(self, name: str, project_dir: Path):
+    def __init__(self, name: str, project_dir: Path, binary_name: str):
         super().__init__(name)
         self._project_dir = project_dir
+        self._binary_name = binary_name
 
     def get_project_dir(self) -> Path:
         return self._project_dir
@@ -57,7 +58,7 @@ class HelperExperiment(Experiment):
             raise RuntimeError("Job is not a HelperJob.")
 
         job.set_command(
-            f"helper run --build-name {self._name} "
+            f"helper run --build-name {self._binary_name} "
             f"--outdir={self._name}/{job.id()} {job.partial_command()}"
         )
         job.set_cwd(self.get_project_dir())
