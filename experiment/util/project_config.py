@@ -1,8 +1,8 @@
+from ..cli import assets
 from .defaults import config_file_name, gem5_repo_url
 
 import json
 import os
-import pkg_resources
 import platform
 import shutil
 import subprocess
@@ -10,6 +10,7 @@ import subprocess
 from argparse import Namespace
 from enum import Enum
 from git import Repo
+from importlib.resources import files
 from pathlib import Path
 from typing import List, Dict
 from warnings import warn
@@ -370,9 +371,7 @@ class PathConfiguration:
                 "`decorators.py` already exists. I am not going to overwrite it."
             )
         else:
-            decorators_py = pkg_resources.resource_filename(
-                "experiment.cli", "assets/decorators.py"
-            )
+            decorators_py = files(assets).joinpath("decorators.py")
             shutil.copy(
                 decorators_py,
                 scripts_util_dir / "decorators.py",
@@ -382,9 +381,7 @@ class PathConfiguration:
                 "`run_example.py` already exists. I am not going to overwrite it."
             )
         else:
-            example_py = pkg_resources.resource_filename(
-                "experiment.cli", "assets/run_example.py"
-            )
+            example_py = files(assets).joinpath("run_example.py")
             shutil.copy(
                 example_py,
                 scripts_dir / "run_example.py",

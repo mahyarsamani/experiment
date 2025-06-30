@@ -1,4 +1,5 @@
 import os
+import platform
 import psutil
 import subprocess
 
@@ -40,8 +41,9 @@ class Worker(Service):
 
         env = os.environ.copy()
         if job.env_path() != Path("/dev/null"):
-            env["VIRTUAL_ENV"] = str(job.env_path())
-            env["PATH"] = f"{job.env_path()}/bin:" + env["PATH"]
+            effective_env_path = job.env_path() / f"{platform.machine()}"
+            env["VIRTUAL_ENV"] = str(effective_env_path)
+            env["PATH"] = f"{effective_env_path}/bin:" + env["PATH"]
 
         if debug:
             with open(f"{job.cwd()}/stdout.log", "a") as stdout_log, open(
