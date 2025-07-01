@@ -67,3 +67,54 @@ class Scheduler:
                 break
             sleep(poll_interval_seconds)
         print("All jobs completed.")
+
+
+# TODO: Incorporate the following snippet into the Scheduler class
+# import paramiko
+
+
+# def run_command_in_tmux(
+#     host, username, key_path, venv_path, command, session_name="my_session"
+# ):
+#     # Set up SSH client
+#     ssh = paramiko.SSHClient()
+#     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+#     ssh.connect(hostname=host, username=username, key_filename=key_path)
+
+#     # Build the command to run inside tmux
+#     full_cmd = f"""
+#     tmux new-session -d -s {session_name} '
+#     echo "Activating venv..." > ~/tmux_debug.log;
+#     source {venv_path}/bin/activate 2>> ~/tmux_debug.log;
+#     echo "Running command..." >> ~/tmux_debug.log;
+#     {command} >> ~/tmux_debug.log 2>&1;
+#     echo "Exit code: $?" >> ~/tmux_debug.log;
+#     sleep 60'
+#     """
+
+#     stdin, stdout, stderr = ssh.exec_command(full_cmd)
+#     exit_status = stdout.channel.recv_exit_status()
+
+#     # Output logs
+#     print("STDOUT:")
+#     print(stdout.read().decode())
+#     print("STDERR:")
+#     print(stderr.read().decode())
+
+#     if exit_status == 0:
+#         print("✅ Command started in tmux session.")
+#     else:
+#         print("❌ Error starting command in tmux session.")
+
+#     ssh.close()
+
+
+# if __name__ == "__main__":
+#     # Example usage
+#     run_command_in_tmux(
+#         host="azacca.idav.ucdavis.edu",
+#         username="msamani",
+#         key_path="/home/msamani/.ssh/experiment_key",
+#         venv_path="/home/msamani/darchr/scatter-gather-opt/env/aarch64",
+#         command="helper work",
+#     )
