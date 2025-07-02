@@ -8,7 +8,6 @@ class Job:
         self._partial_command = None
         self._command = None
         self._cwd = None
-        self._env_path = None
         self._id = None
 
     def set_partial_command(self, partial_command: str) -> None:
@@ -35,14 +34,6 @@ class Job:
             raise RuntimeError("CWD has not been set.")
         return self._cwd
 
-    def set_env_path(self, env_path: Path) -> None:
-        self._env_path = env_path.resolve()
-
-    def env_path(self) -> Path:
-        if self._env_path is None:
-            raise RuntimeError("Env path has not been set.")
-        return self._env_path
-
     def id(self) -> str:
         if self._id is None:
             self._id = hashlib.sha256(
@@ -55,7 +46,6 @@ class Job:
             "_partial_command": self._partial_command,
             "_command": self._command,
             "_cwd": str(self._cwd),
-            "_env_path": str(self._env_path),
             "_id": self._id,
         }
 
@@ -65,7 +55,6 @@ class Job:
         job._partial_command = data["_partial_command"]
         job._command = data["_command"]
         job._cwd = Path(data["_cwd"])
-        job._env_path = Path(data["_env_path"])
         job._id = data["_id"]
         return job
 

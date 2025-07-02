@@ -3,7 +3,6 @@ from .job import Job
 
 from enum import Enum
 from pathlib import Path
-from typing import Optional
 
 
 class OtherValues(Enum):
@@ -43,20 +42,13 @@ class HelperJob(Job):
 
 
 class HelperExperiment(Experiment):
-    def __init__(self, name: str, project_dir: Path, binary_name: str, python_env_path: Optional[Path]):
+    def __init__(self, name: str, project_dir: Path, binary_name: str):
         super().__init__(name)
         self._project_dir = project_dir
         self._binary_name = binary_name
-        if python_env_path is None:
-            self._python_env_path = self.get_project_dir() / "env"
-        else:
-            self._python_env_path = python_env_path
 
     def get_project_dir(self) -> Path:
         return self._project_dir
-
-    def get_env_path(self) -> Path:
-        return self._python_env_path
 
     def _register_job(self, job):
         if not isinstance(job, HelperJob):
@@ -67,4 +59,3 @@ class HelperExperiment(Experiment):
             f"--outdir={self._name}/{job.id()} {job.partial_command()}"
         )
         job.set_cwd(self.get_project_dir())
-        job.set_env_path(self.get_env_path())

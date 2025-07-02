@@ -35,6 +35,7 @@ class Scheduler:
         experiment: Experiment,
         status_board_path: Path,
         poll_interval_seconds: int = 120,
+        debug: bool = False,
     ):
         remaining_jobs = experiment.get_jobs()
         num_active_jobs = 0
@@ -57,7 +58,7 @@ class Scheduler:
                     job = remaining_jobs.pop(0)
                     serialized_job = job.serialize()
                     pid = connection.root.launch_job(
-                        serialized_job, debug=True
+                        serialized_job, host.python_env_path(), debug=debug
                     )
                     active_jobs.append((pid, job.command()))
                     num_active_jobs += 1

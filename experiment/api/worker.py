@@ -35,15 +35,14 @@ class Worker(Service):
     def exposed_launch_job(
         self,
         serialized_job: dict,
+        python_env_path: Path,
         debug: bool = False,
     ) -> int:
         job = Job.deserialize(serialized_job)
 
         env = os.environ.copy()
-        if job.env_path() != Path("/dev/null"):
-            effective_env_path = job.env_path() / f"{platform.machine()}"
-            env["VIRTUAL_ENV"] = str(effective_env_path)
-            env["PATH"] = f"{effective_env_path}/bin:" + env["PATH"]
+        env["VIRTUAL_ENV"] = str(python_env_path)
+        env["PATH"] = f"{python_env_path}/bin:" + env["PATH"]
 
         if debug:
             with open(f"{job.cwd()}/stdout.log", "a") as stdout_log, open(
