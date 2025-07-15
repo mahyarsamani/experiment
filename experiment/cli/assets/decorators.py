@@ -1,10 +1,12 @@
 import json
+import re
 import sys
 
 from pathlib import Path
+from warnings import warn
 
 
-def expose_prject_dir(run):
+def expose_project_dir(run):
     def wrapper(*args, **kwargs):
         proj_dir = Path(__file__).resolve().parent.parent.parent
         sys.path.append(proj_dir.as_posix())
@@ -39,5 +41,39 @@ def record_args(run):
         (outdir / "run_function_called").touch()
         run(*args, **kwargs)
         (outdir / "simulation_finished").touch()
+
+    return wrapper
+
+
+def clear_outdir(run):
+    def wrapper(*args, **kwargs):
+        try:
+            from m5 import options
+
+            outdir = Path(options.outdir).resolve()
+        except ImportError:
+            raise RuntimeError("`clear_outdir` can only be used with gem5.")
+
+        def should_delete(item_name: str):
+            if item_name in [
+                "params.json",
+                "run_function_called",
+                "simulation_finished",
+            ]:
+                return True
+
+            dump_pattern = re.compile(
+                rf"^{re.escape('stats_dump_')}(\d+){re.escape('.txt')}$"
+            )
+            if dump_pattern.match(item_name):
+                return True
+
+            return False
+
+        for item in outdir.iterdir():
+            if item.is_file() and should_delete(item.name):
+                warn(f"Deleting {item.name} from outdir {outdir}.")
+                item.unlink()
+        run(*args, **kwargs)
 
     return wrapper

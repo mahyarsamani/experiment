@@ -3,13 +3,11 @@ from ..util.project_config import (
     BinaryOpt,
     CompileConfiguration,
     ISA,
-    Linker,
     PathConfiguration,
     Protocol,
 )
 
 import argparse
-import os
 import subprocess
 
 
@@ -148,6 +146,10 @@ def finalize_run_args(run_args, unknown_args):
     if run_args.override:
         command = "M5_OVERRIDE_PY_SOURCE=true " + command
 
+    # TODO: first try run_args.config as an abosolute path, if it fails,
+    # try to find it relative to the project directory, if it fails,
+    # try to find it relative to the scripts directory, otherwise raise an error.
+    # Do it using pathlib.Path.
     command += f" {run_args.config}"
     for unknown_arg in unknown_args:
         command += f" {unknown_arg}"
