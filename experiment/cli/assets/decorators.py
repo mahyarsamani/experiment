@@ -57,6 +57,7 @@ def clear_outdir(run):
         def should_delete(item_name: str):
             if item_name in [
                 "params.json",
+                "process_info.txt",
                 "run_function_called",
                 "simulation_finished",
             ]:
