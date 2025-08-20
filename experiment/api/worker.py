@@ -1,10 +1,10 @@
 import os
-import platform
 import psutil
 import subprocess
 
 from pathlib import Path
 from rpyc import Service
+from typing import List, Tuple
 
 from .job import Job
 
@@ -36,6 +36,7 @@ class Worker(Service):
         self,
         serialized_job: dict,
         python_env_path: Path,
+        env_vars: List[Tuple[str, str]] = [],
         debug: bool = False,
     ) -> int:
         job = Job.deserialize(serialized_job)
@@ -43,6 +44,9 @@ class Worker(Service):
         env = os.environ.copy()
         env["VIRTUAL_ENV"] = str(python_env_path)
         env["PATH"] = f"{python_env_path}/bin:" + env["PATH"]
+
+        for var, value in env_vars:
+            env[var] = value
 
         if debug:
             with open(f"{job.cwd()}/stdout.log", "a") as stdout_log, open(

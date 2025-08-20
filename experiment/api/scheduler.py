@@ -40,6 +40,7 @@ class Scheduler:
         remaining_jobs = experiment.get_jobs()
         num_active_jobs = 0
         while True:
+            schedule_queue = []
             for host in self._hosts:
                 connection = self._host_connections[host]
                 active_jobs = self._host_info[host.name()]["active_jobs"]
@@ -50,18 +51,31 @@ class Scheduler:
                         inactive_jobs.append((pid, job_cmd))
                         active_jobs.remove((pid, job_cmd))
                         num_active_jobs -= 1
-                for _ in range(
-                    min(
-                        len(remaining_jobs), host.capacity() - len(active_jobs)
-                    )
-                ):
-                    job = remaining_jobs.pop(0)
-                    serialized_job = job.serialize()
-                    pid = connection.root.launch_job(
-                        serialized_job, host.python_env_path(), debug=debug
-                    )
-                    active_jobs.append((pid, job.command()))
-                    num_active_jobs += 1
+                schedule_queue.append(
+                    (host, host.capacity() - len(active_jobs))
+                )
+            schedule_queue.sort(key=lambda x: x[1], reverse=True)
+            while True:
+                if not remaining_jobs:
+                    break
+                if not schedule_queue:
+                    break
+
+                host, available_slots = schedule_queue.pop(0)
+                if available_slots == 0:
+                    continue
+
+                connection = self._host_connections[host]
+                active_jobs = self._host_info[host.name()]["active_jobs"]
+                job = remaining_jobs.pop(0)
+                serialized_job = job.serialize()
+                pid = connection.root.launch_job(
+                    serialized_job, host.python_env_path(), debug=debug
+                )
+                active_jobs.append((pid, job.command()))
+                num_active_jobs += 1
+                schedule_queue.append((host, available_slots - 1))
+
             with open(status_board_path, "w") as status_board:
                 json.dump(self._host_info, status_board, indent=2)
             if num_active_jobs == 0 and len(remaining_jobs) == 0:

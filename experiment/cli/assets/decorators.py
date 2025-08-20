@@ -69,6 +69,10 @@ def clear_outdir(run):
             if dump_pattern.match(item_name):
                 return True
 
+            readfile_pattern = re.compile(rf"^readfile_.*$")
+            if readfile_pattern.match(item_name):
+                return True
+
             return False
 
         for item in outdir.iterdir():
