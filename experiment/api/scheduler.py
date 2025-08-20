@@ -3,7 +3,7 @@ import rpyc
 
 from pathlib import Path
 from time import sleep
-from typing import List
+from typing import List, Tuple
 
 from .experiment import Experiment
 from .host import Host
@@ -35,6 +35,7 @@ class Scheduler:
         experiment: Experiment,
         status_board_path: Path,
         poll_interval_seconds: int = 120,
+        env_vars: List[Tuple[str, str]] = [],
         debug: bool = False,
     ):
         remaining_jobs = experiment.get_jobs()
@@ -70,7 +71,10 @@ class Scheduler:
                 job = remaining_jobs.pop(0)
                 serialized_job = job.serialize()
                 pid = connection.root.launch_job(
-                    serialized_job, host.python_env_path(), debug=debug
+                    serialized_job,
+                    host.python_env_path(),
+                    env_vars=host.env_vars(),
+                    debug=debug,
                 )
                 active_jobs.append((pid, job.command()))
                 num_active_jobs += 1
