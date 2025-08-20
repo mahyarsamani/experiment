@@ -36,8 +36,8 @@ class Worker(Service):
         self,
         serialized_job: dict,
         python_env_path: Path,
-        env_vars: List[Tuple[str, str]] = [],
-        debug: bool = False,
+        env_vars: List[Tuple[str, str]],
+        debug: bool,
     ) -> int:
         job = Job.deserialize(serialized_job)
 
