@@ -1,5 +1,5 @@
+from ..common.config_util import _get_project_config
 import argparse
-import subprocess
 
 
 def main_function():
@@ -13,28 +13,36 @@ def main_function():
     work = subparser.add_parser(
         "work", description="Spawn a worker server for rpyc."
     )
+    schedule = subparser.add_parser(
+        "schedule", description="Spawn a scheduler server for rpyc."
+    )
 
     parsed_args, for_subparser = parser.parse_known_args()
     if parsed_args.command == "initialize":
-        from .initialize import parse_initialize_args, finalize_initialize_args
+        from .initialize import parse_initialize_args, _process_initialize_args
 
         known_args, unknown_args = parse_initialize_args(for_subparser)
-        finalize_initialize_args(known_args, unknown_args)
+        _process_initialize_args(known_args, unknown_args)
     elif parsed_args.command == "build":
-        from .build import parse_build_args, finalize_build_args
+        from .build import parse_build_args, _process_build_args
 
         known_args, unknown_args = parse_build_args(for_subparser)
-        finalize_build_args(known_args, unknown_args)
+        _process_build_args(_get_project_config(), known_args, unknown_args)
     elif parsed_args.command == "run":
-        from .run import parse_run_args, finalize_run_args
+        from .run import parse_run_args, _process_run_args
 
         known_args, unknown_args = parse_run_args(for_subparser)
-        finalize_run_args(known_args, unknown_args)
+        _process_run_args(_get_project_config(), known_args, unknown_args)
     elif parsed_args.command == "work":
-        from .work import parse_work_args, finalize_work_args
+        from .work import parse_work_args, _process_work_args
 
         known_args, unknown_args = parse_work_args(for_subparser)
-        finalize_work_args(known_args, unknown_args)
+        _process_work_args(known_args, unknown_args)
+    elif parsed_args.command == "schedule":
+        from .schedule import parse_schedule_args, _process_schedule_args
+
+        known_args, unknown_args = parse_schedule_args(for_subparser)
+        _process_schedule_args(known_args, unknown_args)
     else:
         error = "To use this script please refer to this usage.\n"
         error += "\thelper cmd [args]\n"

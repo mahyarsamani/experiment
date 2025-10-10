@@ -1,12 +1,12 @@
-import argparse
-
-from ..util.project_config import (
+from ..common.config_util import initialize_directories
+from ..common.gem5_work import (
     ISA,
     Protocol,
-    Linker,
     BinaryOpt,
-    ProjectConfiguration,
+    gem5ProjectConfiguration,
 )
+
+import argparse
 
 
 def parse_initialize_args(args):
@@ -57,51 +57,36 @@ def parse_initialize_args(args):
         choices=BinaryOpt.return_all_values(),
     )
     parser.add_argument(
-        "default_linker",
-        type=str,
-        help="Default linker to use when compiling.",
-        choices=Linker.return_all_values(),
-    )
-    parser.add_argument(
-        "default_bits_per_set",
+        "--default_bits_per_set",
         type=int,
-        help="Default bits per set. When passing `NOTHING` as "
-        "protocol you should pass _1 for this. If you have specified at least "
-        "one protocol, default value is 64.",
+        help="Number of bits per set to use for Ruby compilation.",
+        default=64,
+        required=False,
     )
-    parser.add_argument(
-        "default_threads",
-        type=int,
-        help="Default number of threads to use when compiling.",
-    )
-
     parser.add_argument(
         "--gem5_resource_json_path",
         type=str,
         help="Path to the gem5 resource JSON file.",
-        default="/dev/null",
         required=False,
     )
 
     return parser.parse_known_args(args)
 
 
-def finalize_initialize_args(initialize_args, unknown_args):
+def _process_initialize_args(initialize_args, unknown_args):
     assert (unknown_args is None) or (len(unknown_args) == 0)
 
-    config = ProjectConfiguration(
+    config = gem5ProjectConfiguration(
         initialize_args.project_name,
         initialize_args.project_dir,
         initialize_args.gem5_source_dir,
-        initialize_args.gem5_resource_json_path,
         initialize_args.gem5_binary_base_dir,
         initialize_args.gem5_out_base_dir,
+        initialize_args.gem5_resource_json_path,
         initialize_args.default_isas,
         initialize_args.default_protocols,
         initialize_args.default_binary_opt,
-        initialize_args.default_linker,
         initialize_args.default_bits_per_set,
-        initialize_args.default_threads,
     )
 
-    config.initialize_directories()
+    initialize_directories(config)

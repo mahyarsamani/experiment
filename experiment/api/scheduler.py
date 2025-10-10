@@ -1,138 +1,147 @@
-import json
-import rpyc
-
-from pathlib import Path
-from time import sleep
-from typing import List
-
-from .experiment import Experiment
+from .dashboard.server import DashboardServer
 from .host import Host
+from .work import Experiment, JobStatus
+
+from rpyc import Connection, Service, connect
+from threading import RLock, Thread
+from time import sleep
+from typing import Dict
+from warnings import warn
 
 
-class Scheduler:
-    def __init__(self, hosts: List[Host], port: int):
-        self._hosts = hosts
-        self._port = port
-        self._host_connections = dict()
-        self._host_info = dict()
+class Scheduler(Service):
+    def __init__(self, polling_secs: int, dashboard_port: int) -> None:
+        super().__init__()
+        print("Initializing scheduler...")
+        self._polling_secs = polling_secs
 
-        self._connect_to_hosts()
+        self._hosts = list()
+        self._hosts_pending_removal = list()
+        self._hosts_lock = RLock()
 
-    def _connect_to_hosts(self):
-        for host in self._hosts:
-            try:
-                connection = rpyc.connect(host.domain(), self._port)
-                self._host_connections[host] = connection
-                self._host_info[host.name()] = dict()
-                self._host_info[host.name()]["active_jobs"] = list()
-                self._host_info[host.name()]["inactive_jobs"] = list()
-            except Exception as err:
-                print(f"Failed to connect to {host.domain()}: {err}")
-                raise err
+        self._experiments = list()
+        self._depleted_experiments = list()
+        self._experiments_pending_removal = list()
+        self._experiments_lock = RLock()
 
-    def schedule(
-        self,
-        experiment: Experiment,
-        status_board_path: Path,
-        poll_interval_seconds: int = 120,
-        debug: bool = False,
-    ):
-        remaining_jobs = experiment.get_jobs()
-        num_active_jobs = 0
+        self._dashboard = DashboardServer(
+            "Experiment Dashboard", "localhost", dashboard_port
+        )
+        self._dashboard_thread = Thread(
+            target=self._dashboard.run, daemon=True
+        )
+        self._schedule_thread = Thread(target=self._schedule_loop, daemon=True)
+
+    def start_service(self) -> None:
+        self._dashboard_thread.start()
+        self._schedule_thread.start()
+
+    def _schedule_loop(self):
+        warn("Scheduler loop started.")
         while True:
-            schedule_queue = []
-            for host in self._hosts:
-                connection = self._host_connections[host]
-                active_jobs = self._host_info[host.name()]["active_jobs"]
-                inactive_jobs = self._host_info[host.name()]["inactive_jobs"]
-                for pid, job_cmd in active_jobs:
-                    running = connection.root.is_running(pid)
-                    if not running:
-                        inactive_jobs.append((pid, job_cmd))
-                        active_jobs.remove((pid, job_cmd))
-                        num_active_jobs -= 1
-                schedule_queue.append(
-                    (host, host.capacity() - len(active_jobs))
+            pending_jobs = list()
+            with self._hosts_lock, self._experiments_lock:
+                # NOTE: Collect all jobs from all experiments.
+                for experiment in self._experiments:
+                    pending_jobs.extend(experiment.jobs())
+                self._depleted_experiments.extend(self._experiments)
+                self._experiments.clear()
+                warn(f"I am scheduling {pending_jobs} on {self._hosts}.")
+                # NOTE: Kill all the killed experiments first.
+                for experiment in self._experiments_pending_removal:
+                    for host in self._hosts:
+                        host.kill_experiment(experiment)
+                    for job in [
+                        j for j in pending_jobs if j.experiment() == experiment
+                    ]:
+                        job.set_status(JobStatus.KILLED)
+                        pending_jobs.remove(job)
+                self._experiments_pending_removal.clear()
+
+                # NOTE: Update hosts pending removal and remove
+                # them  if they have no running jobs.
+                hosts_to_remove = list()
+                for host in self._hosts_pending_removal:
+                    host.update()
+                    if host.num_running_jobs() == 0:
+                        host.disconnect()
+                        hosts_to_remove.append(host)
+                self._hosts_pending_removal = [
+                    h
+                    for h in self._hosts_pending_removal
+                    if h not in hosts_to_remove
+                ]
+                hosts_to_remove.clear()
+
+                # NOTE: Schedule new jobs on available hosts.
+                did_schedule = True
+                while did_schedule:
+                    did_schedule = False
+
+                    for host in self._hosts:
+                        host.update()
+
+                    self._hosts.sort(
+                        key=lambda host: host.capacity(), reverse=True
+                    )
+                    for host in self._hosts:
+                        eligible_jobs = sorted(
+                            [
+                                job
+                                for job in pending_jobs
+                                if job.demand() <= host.capacity()
+                            ],
+                            key=lambda job: job.demand(),
+                            reverse=True,
+                        )
+                        if len(eligible_jobs) > 0:
+                            job = eligible_jobs[0]
+                            host.launch_job(job)
+                            warn(f"Launched {job} on {host}.")
+                            pending_jobs.remove(job)
+                            did_schedule |= True
+                snapshot_hosts = self._hosts.copy()
+                snapshot_pending_jobs = pending_jobs.copy()
+            self._dashboard.update(snapshot_pending_jobs, snapshot_hosts)
+            sleep(self._polling_secs)
+
+    def exposed_add_host(self, serialized_host: Dict):
+        host = Host.deserialize(serialized_host)
+        with self._hosts_lock:
+            if host.name() in [host.name() for host in self._hosts]:
+                warn(f"{host} already added! Won't add again.")
+            else:
+                self._hosts.append(host)
+                self._hosts[-1].connect()
+
+    def exposed_remove_host(self, host_name: str):
+        with self._hosts_lock:
+            if host_name not in [host.name() for host in self._hosts]:
+                warn(f"{host_name} not found!")
+            else:
+                host = next(h for h in self._hosts if h.name() == host_name)
+                self._hosts_pending_removal.append(host)
+                self._hosts.remove(host)
+
+    def exposed_add_experiment(self, serialized_experiment: Dict):
+        experiment = Experiment.deserialize(serialized_experiment)
+        with self._experiments_lock:
+            if experiment.name() in [e.name() for e in self._experiments]:
+                warn(f"{experiment} already added! Won't add again.")
+            else:
+                self._experiments.append(experiment)
+
+    def exposed_remove_experiment(self, experiment_name: str):
+        with self._experiments_lock:
+            if experiment_name not in [e.name() for e in self._experiments]:
+                warn(f"{experiment_name} not found!")
+            else:
+                experiment = next(
+                    e for e in self._experiments if e.name() == experiment_name
                 )
-            schedule_queue.sort(key=lambda x: x[1], reverse=True)
-            while True:
-                if not remaining_jobs:
-                    break
-                if not schedule_queue:
-                    break
-
-                host, available_slots = schedule_queue.pop(0)
-                if available_slots == 0:
-                    continue
-
-                connection = self._host_connections[host]
-                active_jobs = self._host_info[host.name()]["active_jobs"]
-                job = remaining_jobs.pop(0)
-                serialized_job = job.serialize()
-                pid = connection.root.launch_job(
-                    serialized_job,
-                    host.python_env_path(),
-                    host.env_vars(),
-                    debug,
-                )
-                active_jobs.append((pid, job.command()))
-                num_active_jobs += 1
-                schedule_queue.append((host, available_slots - 1))
-
-            with open(status_board_path, "w") as status_board:
-                json.dump(self._host_info, status_board, indent=2)
-            if num_active_jobs == 0 and len(remaining_jobs) == 0:
-                break
-            sleep(poll_interval_seconds)
-        print("All jobs completed.")
+                self._experiments_pending_removal.append(experiment)
+                self._experiments.remove(experiment)
 
 
-# TODO: Incorporate the following snippet into the Scheduler class
-# import paramiko
-
-
-# def run_command_in_tmux(
-#     host, username, key_path, venv_path, command, session_name="my_session"
-# ):
-#     # Set up SSH client
-#     ssh = paramiko.SSHClient()
-#     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-#     ssh.connect(hostname=host, username=username, key_filename=key_path)
-
-#     # Build the command to run inside tmux
-#     full_cmd = f"""
-#     tmux new-session -d -s {session_name} '
-#     echo "Activating venv..." > ~/tmux_debug.log;
-#     source {venv_path}/bin/activate 2>> ~/tmux_debug.log;
-#     echo "Running command..." >> ~/tmux_debug.log;
-#     {command} >> ~/tmux_debug.log 2>&1;
-#     echo "Exit code: $?" >> ~/tmux_debug.log;
-#     sleep 60'
-#     """
-
-#     stdin, stdout, stderr = ssh.exec_command(full_cmd)
-#     exit_status = stdout.channel.recv_exit_status()
-
-#     # Output logs
-#     print("STDOUT:")
-#     print(stdout.read().decode())
-#     print("STDERR:")
-#     print(stderr.read().decode())
-
-#     if exit_status == 0:
-#         print("✅ Command started in tmux session.")
-#     else:
-#         print("❌ Error starting command in tmux session.")
-
-#     ssh.close()
-
-
-# if __name__ == "__main__":
-#     # Example usage
-#     run_command_in_tmux(
-#         host="azacca.idav.ucdavis.edu",
-#         username="msamani",
-#         key_path="/home/msamani/.ssh/experiment_key",
-#         venv_path="/home/msamani/darchr/scatter-gather-opt/env/aarch64",
-#         command="helper work",
-#     )
+def connect_to_scheduler(domain: str, port: int) -> Connection:
+    return connect(domain, port).root

@@ -1,13 +1,14 @@
 import argparse
 
-from util.decorators import expose_prject_dir, record_args
+from util.decorators import clear_outdir, expose_project_dir, record_args
 
 
-@expose_prject_dir
+@expose_project_dir
+@clear_outdir
 @record_args
 def run_example(num_generator_cores):
     """
-    `expose_prject_dir` decorator exposes the project directory to the run
+    `expose_project_dir` decorator exposes the project directory to the run
     function. In other words, you can import any modules from directories that
     have `__init__.py` files in them. Although in this example, I import
     everything from gem5, when you develop new components, you can put them in

@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ title }}</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1 id="title">{{ title }}</h1>
+    <div class="small">Last update: <span id="lu">—</span></div>
+  </header>
+
+  <div class="wrap">
+    <div class="card">
+      <div class="table-head row">
+        <div>Job ID</div>
+        <div>Experiment / Links</div>
+        <div>Host</div>
+        <div>Status</div>
+      </div>
+      <div id="jobs"></div>
+    </div>
+    <div class="small" style="margin-top:8px;">Hosts: <span id="hosts"></span></div>
+  </div>
+
+  <script>
+    const jobsEl = document.getElementById('jobs');
+    const luEl = document.getElementById('lu');
+    const hostsEl = document.getElementById('hosts');
+
+    function fmtTime(epoch) {
+      const d = new Date(epoch * 1000);
+      return d.toLocaleString();
+    }
+
+    function render(state) {
+      luEl.textContent = state.last_update_epoch ? fmtTime(state.last_update_epoch) : '—';
+      hostsEl.textContent = state.hosts.join(', ');
+      jobsEl.innerHTML = state.jobs.map(j => `
+        <div class="row">
+          <div class="kbd">${j.job_id}</div>
+          <div>
+            <div class="kbd" style="margin-bottom:6px;">${j.experiment}</div>
+            <div class="links">${j.links.map(l => `<a href="${l.href}" target="_blank" rel="noopener">${l.label}</a>`).join('')}</div>
+          </div>
+          <div><span class="pill">${j.host}</span></div>
+          <div class="status"><span class="dot" style="background:${j.status_color}"></span>${j.status}</div>
+        </div>`).join('');
+    }
+
+    async function tick() {
+      try {
+        const r = await fetch('/api/state', { cache: 'no-store' });
+        const s = await r.json();
+        render(s);
+      } catch (e) { console.error(e); }
+    }
+
+    setInterval(tick, 2000);
+    window.addEventListener('load', tick);
+  </script>
+</body>
+</html>

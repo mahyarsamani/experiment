@@ -1,23 +1,21 @@
-from ..util.config_util import _get_project_config
-from ..util.project_config import (
+from ..common.cmd_util import run_command
+from ..common.config_util import configure_build_directory
+from ..common.gem5_work import (
     BinaryOpt,
-    CompileConfiguration,
-    Linker,
+    gem5BuildConfiguration,
     ISA,
     Protocol,
 )
 
 import argparse
-import subprocess
 
 
 def parse_build_args(args):
     parser = argparse.ArgumentParser("Parse build command from helper.")
     parser.add_argument(
-        "--build-name",
+        "build_name",
         type=str,
         help="Build name to run.",
-        required=False,
     )
     parser.add_argument(
         "--isas",
@@ -41,22 +39,16 @@ def parse_build_args(args):
         required=False,
     )
     parser.add_argument(
-        "--linker",
-        type=str,
-        help="Linker to use when compiling.",
-        choices=Linker.return_all_values(),
-        required=False,
-    )
-    parser.add_argument(
         "--bits-per-set",
         type=int,
-        help="Number of bits per sit to use for Ruby compilation.",
+        help="Number of bits per set to use for Ruby compilation.",
         required=False,
     )
     parser.add_argument(
-        "--threads",
-        type=int,
-        help="Number of threads to use when compiling.",
+        "--linker",
+        type=str,
+        help="Linker to use when compiling other than ld.",
+        choices=["bfd", "gold", "mold"],
         required=False,
     )
     parser.add_argument(
@@ -75,32 +67,49 @@ def parse_build_args(args):
         default=False,
         help="Whether to compile gem5 without tcmalloc.",
     )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        help="Number of threads to use when compiling.",
+        required=False,
+    )
     return parser.parse_known_args(args)
 
 
-def finalize_build_args(build_args, unknown_args):
+def _process_build_args(proj_config, build_args, unknown_args):
     assert (unknown_args is None) or (len(unknown_args) == 0)
 
-    proj_config = _get_project_config()
-
-    compile_config = CompileConfiguration.from_args_and_config(
-        build_args, proj_config.compile_config
+    build_dir = (
+        proj_config.path_config().gem5_binary_base_dir()
+        / build_args.build_name
     )
 
-    build_dir = proj_config.configure_build_directory(
-        build_args, compile_config
+    build_config = gem5BuildConfiguration.from_args_and_config(
+        build_args,
+        proj_config.build_config(),
+    )
+
+    configure_build_directory(
+        proj_config.path_config().gem5_source_dir(), build_dir, build_config
     )
 
     command = (
-        f"scons -C {proj_config.path_config.gem5_source_dir} "
-        f"gem5.{compile_config.binary_opt} "
-        f"-j {compile_config.threads} "
-        f"--linker={compile_config.linker}"
+        f"scons -C {proj_config.path_config().gem5_source_dir()} "
+        f"gem5.{build_config.binary_opt}"
     )
-
+    if build_args.linker:
+        command += f" --linker={build_args.linker}"
+        linker_override_path = build_dir / "gem5.build" / "linker_override"
+        linker_override_path.unlink(missing_ok=True)
+        linker_override_path.touch()
+        linker_override_path.write_text(f"{build_args.linker}\n")
     if build_args.gprof:
         command += " --gprof"
+        (build_dir / "gem5.build" / "built_with_gprof").touch()
     if build_args.no_tcmalloc:
         command += " --without-tcmalloc"
+        (build_dir / "gem5.build" / "built_without_tcmalloc").touch()
+    if build_args.threads:
+        command += f" -j {build_args.threads}"
 
-    subprocess.run(["bash", "-c", command], cwd=build_dir)
+    run_command(["bash", "-c", command], build_dir)
