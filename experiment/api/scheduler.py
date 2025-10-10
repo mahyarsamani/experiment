@@ -12,7 +12,6 @@ from warnings import warn
 class Scheduler(Service):
     def __init__(self, polling_secs: int, dashboard_port: int) -> None:
         super().__init__()
-        print("Initializing scheduler...")
         self._polling_secs = polling_secs
 
         self._hosts = list()
@@ -37,7 +36,6 @@ class Scheduler(Service):
         self._schedule_thread.start()
 
     def _schedule_loop(self):
-        warn("Scheduler loop started.")
         while True:
             pending_jobs = list()
             with self._hosts_lock, self._experiments_lock:
