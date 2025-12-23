@@ -1,4 +1,4 @@
-from .work import JobStatus, Job, Experiment
+from .work import Job, Experiment
 
 import rpyc
 
