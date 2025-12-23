@@ -6,7 +6,7 @@ from argparse import Namespace
 from enum import Enum
 from hashlib import sha256
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from warnings import warn
 
 
@@ -163,8 +163,12 @@ class OtherValues(Enum):
             return False
         return True
 
+    def __str__(self) -> str:
+        if self == OtherValues.Store_Const:
+            return "OtherValues.Store_Const"
 
-class gem5Simulation(Job):
+
+class gem5FSSimulation(Job):
     def make_command(
         gem5_path, outdir, run_script_path: Path, *args, **kwargs
     ) -> str:
@@ -193,20 +197,51 @@ class gem5Simulation(Job):
         )
         id = calculate_hash(items)
         outdir = experiment.outdir() / id
-        command = gem5Simulation.make_command(
+        command = gem5FSSimulation.make_command(
             experiment.gem5_path(), outdir, run_script_path, *args, **kwargs
         )
         super().__init__(
             experiment,
+            experiment.cwd(),
             command,
             outdir,
             demand,
             id,
-            [("stats", outdir / "stats.txt")],
+            [
+                ("stats", outdir / "stats.txt"),
+                ("terminal", outdir / "board.terminal"),
+                ("constructor", outdir / "constructor.py"),
+            ],
         )
         self._run_script_path = run_script_path
         self._args = args
         self._kwargs = kwargs
+
+    def optional_dump(self) -> List[Tuple[str, str]]:
+        return [("constructor.py", self._write_constructor())]
+
+    def _write_constructor(self) -> str:
+        args = ""
+        for arg in self._args:
+            if isinstance(arg, str):
+                args += f'\t"{arg}",\n'
+            else:
+                args += f"\t{arg},\n"
+        kwargs = ""
+        for key, val in self._kwargs:
+            if isinstance(val, str):
+                kwargs += f'\t{key}="{val}",\n'
+            else:
+                kwargs += f"\t{key}={val},\n"
+        return f"""
+job = gem5FSSimulation(
+    getExperiment(),
+    {self._demand},
+    Path({self._run_script_path.as_posix()}),
+{args}
+{kwargs}
+)
+"""
 
     def id_dict(self) -> Dict:
         return {
@@ -220,11 +255,16 @@ class gem5Experiment(Experiment):
     def __init__(
         self,
         name: str,
+        cwd: Path,
         gem5_path: Path,
         outdir: Path,
     ):
         super().__init__(name, outdir)
+        self._cwd = cwd.resolve()
         self._gem5_path = gem5_path.resolve()
+
+    def cwd(self) -> Path:
+        return self._cwd
 
     def gem5_path(self) -> Path:
         return self._gem5_path

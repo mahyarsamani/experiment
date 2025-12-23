@@ -5,84 +5,11 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 
-class JobStatus(Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    SLEEP = "sleep"
-    WAITING = "waiting"
-    STOPPED = "stopped"
-    ZOMBIE = "zombie"
-    EXITED = "exited"
-    KILLED = "killed"
-    FAILED = "failed"
-
-    def running(self) -> bool:
-        return self in [
-            JobStatus.RUNNING,
-            JobStatus.SLEEP,
-            JobStatus.WAITING,
-            JobStatus.STOPPED,
-            JobStatus.ZOMBIE,
-        ]
-
-    def color(self) -> str:
-        return {
-            JobStatus.PENDING: "#999999",
-            JobStatus.RUNNING: "#ff3fff",
-            JobStatus.SLEEP: "#7fcfff",
-            JobStatus.WAITING: "#ff7f00",
-            JobStatus.STOPPED: "#ff0000",
-            JobStatus.ZOMBIE: "#5a7f3f",
-            JobStatus.EXITED: "#00ff00",
-            JobStatus.KILLED: "#af00ff",
-            JobStatus.FAILED: "#7f3f00",
-        }[self]
-
-    @classmethod
-    def from_string(cls, status: str) -> "JobStatus":
-        try:
-            return {
-                "pending": cls.PENDING,
-                "running": cls.RUNNING,
-                "sleep": cls.SLEEP,
-                "waiting": cls.WAITING,
-                "stopped": cls.STOPPED,
-                "zombie": cls.ZOMBIE,
-                "exited": cls.EXITED,
-                "killed": cls.KILLED,
-                "failed": cls.FAILED,
-            }[status]
-        except KeyError:
-            raise RuntimeError(f"Unknown job status {status}.")
-
-    @classmethod
-    def psutil_to_string(cls, status: str) -> str:
-        try:
-            return {
-                psutil.STATUS_RUNNING: "running",
-                psutil.STATUS_SLEEPING: "sleep",
-                psutil.STATUS_DISK_SLEEP: "waiting",
-                psutil.STATUS_STOPPED: "stopped",
-                psutil.STATUS_TRACING_STOP: "stopped",
-                psutil.STATUS_ZOMBIE: "zombie",
-                psutil.STATUS_DEAD: "exited",
-                psutil.STATUS_WAKING: "running",
-                psutil.STATUS_IDLE: "sleep",
-                psutil.STATUS_LOCKED: "waiting",
-                psutil.STATUS_WAITING: "waiting",
-                psutil.STATUS_PARKED: "waiting",
-            }[status]
-
-        except KeyError:
-            raise RuntimeError(
-                f"Missing translator for psutil status {status}."
-            )
-
-
 class Job:
     def __init__(
         self,
         experiment: "Experiment",
+        cwd: Path,
         command: str,
         outdir: Path,
         demand: int,
@@ -94,12 +21,13 @@ class Job:
         self._experiment = experiment
         # NOTE: Relating to launching a process.
         # These attributes are useful for Worker from worker.py
+        self._cwd = cwd
         self._command = command
         self._outdir = outdir
         self._stdout = self._outdir / "stdout"
         self._stderr = self._outdir / "stderr"
         self._pid = -1
-        self._status = JobStatus.PENDING
+        self._status = "pending"
 
         # NOTE: Scheduling and managing a job
         self._demand = demand
@@ -110,6 +38,9 @@ class Job:
 
     def experiment(self) -> "Experiment":
         return self._experiment
+
+    def cwd(self) -> Path:
+        return self._cwd
 
     def command(self) -> str:
         return self._command
@@ -129,11 +60,17 @@ class Job:
     def id(self) -> str:
         return self._id
 
-    def set_status(self, status: JobStatus) -> None:
+    def set_status(self, status: str) -> None:
         self._status = status
 
-    def status(self) -> JobStatus:
+    def status(self) -> str:
         return self._status
+
+    def running(self) -> bool:
+        return self._status == "running"
+
+    def exited(self) -> bool:
+        return self._status == "exited"
 
     def set_pid(self, pid: int) -> None:
         self._pid = pid
@@ -150,11 +87,15 @@ class Job:
     def aux_file_io(self) -> List[Tuple[str, Path]]:
         return self._aux_file_io
 
+    def optional_dump(self) -> List[Tuple[str, str]]:
+        pass
+
     def id_dict(self) -> Dict:
         raise NotImplementedError
 
     def serialize(self) -> Dict:
         return {
+            "cwd": self._cwd.as_posix(),
             "command": self._command,
             "outdir": self._outdir.as_posix(),
             "demand": self._demand,
@@ -168,6 +109,7 @@ class Job:
     def deserialize(
         cls, experiment: "Experiment", serialized_job: Dict
     ) -> "Job":
+        cwd = Path(serialized_job["cwd"])
         command = serialized_job["command"]
         outdir = Path(serialized_job["outdir"])
         demand = serialized_job["demand"]
@@ -176,12 +118,12 @@ class Job:
             (name, Path(path)) for name, path in serialized_job["aux_file_io"]
         ]
 
-        job = cls(experiment, command, outdir, demand, id, aux_file_io)
+        job = cls(experiment, cwd, command, outdir, demand, id, aux_file_io)
 
         return job
 
     def __str__(self) -> str:
-        return f"{__class__}(command={self._command}, outdir={self._outdir}, status={self._status}, pid={self._pid})"
+        return f"{__class__}(cwd={self._cwd}, command={self._command}, outdir={self._outdir}, status={self._status}, pid={self._pid})"
 
 
 class Experiment:

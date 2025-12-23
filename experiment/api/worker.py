@@ -1,14 +1,23 @@
 import os
 import psutil
+import signal
 import subprocess
+import time
 
+from dataclasses import dataclass
 from flask import abort, Flask, send_file
 from pathlib import Path
 from rpyc import Service
 from threading import Thread
-from typing import List
+from typing import List, Tuple
 
-from .work import JobStatus
+
+@dataclass
+class JobInfo:
+    pid: int
+    create_time: float
+    pgid: int
+    popen: subprocess.Popen
 
 
 def _safe_route(app: Flask, rule: str):
@@ -41,6 +50,7 @@ class Worker(Service):
             target=self.run_file_server, daemon=True
         )
         self._allowed_paths = list()
+        self._jobs = dict()
 
         self._initialize_file_routes()
 
@@ -83,7 +93,12 @@ class Worker(Service):
         print("Client disconnected")
 
     def exposed_launch_job(
-        self, command: str, outdir_str: str, other_paths: List[str]
+        self,
+        cwd: str,
+        command: str,
+        outdir_str: str,
+        other_paths: List[str],
+        optional_dump: List[Tuple[str, str]],
     ) -> int:
         def _initialize_files(outdir: Path) -> None:
             if not outdir.exists():
@@ -95,17 +110,34 @@ class Worker(Service):
             pid = -1
             stdout, stderr = outdir / "stdout", outdir / "stderr"
             with open(stdout, "w") as out, open(stderr, "w") as err:
-                pid = subprocess.Popen(
+                p = subprocess.Popen(
                     command,
+                    cwd=cwd,
                     stdin=subprocess.DEVNULL,
                     stdout=out,
                     stderr=err,
                     shell=True,
                     start_new_session=True,
-                ).pid
+                )
+                pid = p.pid
+                try:
+                    proc = psutil.Process(pid)
+                    ct = proc.create_time()
+                except psutil.Error:
+                    ct = time.time()
+                try:
+                    pgid = os.getpgid(pid)
+                except ProcessLookupError:
+                    pgid = pid
+                self._jobs[pid] = JobInfo(
+                    pid=pid, create_time=ct, pgid=pgid, popen=p
+                )
             self._allowed_paths.extend(
                 [stdout, stderr] + [Path(p) for p in other_paths]
             )
+            for file_name, file_content in optional_dump:
+                with open(outdir / file_name, "w") as dump:
+                    dump.write(file_content)
             return pid
         except:
             return -1
@@ -121,11 +153,59 @@ class Worker(Service):
         return True
 
     def exposed_job_status(self, pid: int) -> str:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return "exited"
-        except:
-            return "failed"
+        def _proc_is_executing(proc: psutil.Process) -> bool:
+            try:
+                if not proc.is_running():
+                    return False
+                st = proc.status()
+                return st not in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD)
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                return False
+            except psutil.AccessDenied:
+                try:
+                    os.kill(proc.pid, 0)
+                    return True
+                except OSError:
+                    return False
 
-        return JobStatus.psutil_to_string(psutil.Process(pid).status())
+        def _any_alive_in_pgid(pgid: int) -> bool:
+            for p in psutil.process_iter(attrs=["pid"]):
+                pid = p.info["pid"]
+                try:
+                    if os.getpgid(pid) == pgid:
+                        if _proc_is_executing(psutil.Process(pid)):
+                            return True
+                except (ProcessLookupError, PermissionError):
+                    continue
+                except psutil.Error:
+                    continue
+            return False
+
+        job = self._jobs.get(pid)
+        if job is not None:
+            rc = job.popen.poll()
+            if rc is not None:
+                return "running" if _any_alive_in_pgid(job.pgid) else "exited"
+            try:
+                p = psutil.Process(pid)
+                if abs(p.create_time() - job.create_time) > 1.0:
+                    self._jobs.pop(pid, None)
+                    return "exited"
+            except psutil.NoSuchProcess:
+                return "running" if _any_alive_in_pgid(job.pgid) else "exited"
+            except psutil.Error:
+                pass
+
+            return "running" if _any_alive_in_pgid(job.pgid) else "exited"
+
+        try:
+            p = psutil.Process(pid)
+            return "running" if _proc_is_executing(p) else "exited"
+        except psutil.NoSuchProcess:
+            return "exited"
+        except psutil.Error:
+            try:
+                os.kill(pid, 0)
+                return "running"
+            except OSError:
+                return "exited"

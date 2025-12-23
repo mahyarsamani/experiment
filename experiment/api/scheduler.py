@@ -36,8 +36,8 @@ class Scheduler(Service):
         self._schedule_thread.start()
 
     def _schedule_loop(self):
+        pending_jobs = list()
         while True:
-            pending_jobs = list()
             with self._hosts_lock, self._experiments_lock:
                 # NOTE: Collect all jobs from all experiments.
                 for experiment in self._experiments:

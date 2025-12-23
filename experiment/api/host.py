@@ -59,9 +59,11 @@ class Host:
             raise RuntimeError(f"Connection not established for {self}.")
         job.set_pid(
             self._connection.root.launch_job(
+                job.cwd().as_posix(),
                 job.command(),
                 job.outdir().as_posix(),
                 [path.as_posix() for _, path in job.aux_file_io()],
+                job.optional_dump(),
             )
         )
         self._running_jobs.append(job)
@@ -71,7 +73,7 @@ class Host:
         self.update()
 
         for job in self._running_jobs:
-            if not job.status().running():
+            if not job.running():
                 raise RuntimeError(f"Tried to kill {job} that is not running.")
             if job.experiment() == experiment:
                 self._connection.root.kill_job(job.pid())
@@ -79,12 +81,9 @@ class Host:
 
     def update(self):
         for job in self._running_jobs:
-            job.set_status(
-                JobStatus.from_string(
-                    self._connection.root.job_status(job.pid())
-                )
-            )
-            if not job.status().running():
+            job.set_status(self._connection.root.job_status(job.pid()))
+
+            if job.exited():
                 self._finished_jobs.append(job)
                 self._running_jobs.remove(job)
 
