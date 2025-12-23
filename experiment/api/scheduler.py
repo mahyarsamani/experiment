@@ -1,6 +1,6 @@
 from .dashboard.server import DashboardServer
 from .host import Host
-from .work import Experiment, JobStatus
+from .work import Experiment
 
 from rpyc import Connection, Service, connect
 from threading import RLock, Thread
@@ -52,7 +52,7 @@ class Scheduler(Service):
                     for job in [
                         j for j in pending_jobs if j.experiment() == experiment
                     ]:
-                        job.set_status(JobStatus.KILLED)
+                        job.set_status("exited")
                         pending_jobs.remove(job)
                 self._experiments_pending_removal.clear()
 
