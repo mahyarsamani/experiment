@@ -15,6 +15,7 @@ class Job:
         demand: int,
         id: str,
         aux_file_io: List[Tuple[str, Path]] = [],
+        optional_dump: List[Tuple[str, str, Path]] = [],
     ) -> None:
         # NOTE: This attribute is useful for hosts to cancel
         # all jobs from a certain experiment.
@@ -34,6 +35,7 @@ class Job:
 
         # NOTE: Tracking and printing job status
         self._id = id
+        self._optional_dump = optional_dump
         self._aux_file_io = aux_file_io
 
     def experiment(self) -> "Experiment":
@@ -79,16 +81,20 @@ class Job:
         return self._pid
 
     def file_io(self) -> List[Tuple[str, Path]]:
-        return [
-            ("stdout", self._stdout),
-            ("stderr", self._stderr),
-        ] + self._aux_file_io
+        return (
+            [
+                ("stdout", self._stdout),
+                ("stderr", self._stderr),
+            ]
+            + self._aux_file_io
+            + [(name, path) for name, _, path in self._optional_dump]
+        )
 
     def aux_file_io(self) -> List[Tuple[str, Path]]:
         return self._aux_file_io
 
-    def optional_dump(self) -> List[Tuple[str, str]]:
-        pass
+    def optional_dump(self) -> List[Tuple[str, Path]]:
+        return self._optional_dump
 
     def id_dict(self) -> Dict:
         raise NotImplementedError
@@ -102,6 +108,10 @@ class Job:
             "id": self._id,
             "aux_file_io": [
                 (name, path.as_posix()) for name, path in self._aux_file_io
+            ],
+            "optional_dump": [
+                (name, content, path.as_posix())
+                for name, content, path in self._optional_dump
             ],
         }
 
@@ -117,13 +127,26 @@ class Job:
         aux_file_io = [
             (name, Path(path)) for name, path in serialized_job["aux_file_io"]
         ]
+        optional_dump = [
+            (name, content, Path(path))
+            for name, content, path in serialized_job["optional_dump"]
+        ]
 
-        job = cls(experiment, cwd, command, outdir, demand, id, aux_file_io)
+        job = cls(
+            experiment,
+            cwd,
+            command,
+            outdir,
+            demand,
+            id,
+            aux_file_io=aux_file_io,
+            optional_dump=optional_dump,
+        )
 
         return job
 
-    def __str__(self) -> str:
-        return f"{__class__}(cwd={self._cwd}, command={self._command}, outdir={self._outdir}, status={self._status}, pid={self._pid})"
+    def __str__(self):
+        return f"{__class__.__name__}(cwd={self._cwd}, command={self._command}, outdir={self._outdir}, status={self._status}, pid={self._pid})"
 
 
 class Experiment:
@@ -167,7 +190,9 @@ class Experiment:
         return experiment
 
     def __str__(self) -> str:
-        return f"{__class__}(name={self._name}, outdir={self._outdir})"
+        return (
+            f"{__class__.__name__}(name={self._name}, outdir={self._outdir})"
+        )
 
 
 class ProjectConfiguration:

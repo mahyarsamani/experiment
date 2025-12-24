@@ -63,7 +63,10 @@ class Host:
                 job.command(),
                 job.outdir().as_posix(),
                 [path.as_posix() for _, path in job.aux_file_io()],
-                job.optional_dump(),
+                [
+                    (content, path.as_posix())
+                    for _, content, path in job.optional_dump()
+                ],
             )
         )
         self._running_jobs.append(job)
@@ -77,7 +80,7 @@ class Host:
                 raise RuntimeError(f"Tried to kill {job} that is not running.")
             if job.experiment() == experiment:
                 self._connection.root.kill_job(job.pid())
-                job.set_status(JobStatus.KILLED)
+                job.set_status("killed")
 
     def update(self):
         for job in self._running_jobs:

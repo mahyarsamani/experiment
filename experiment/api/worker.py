@@ -135,11 +135,14 @@ class Worker(Service):
             self._allowed_paths.extend(
                 [stdout, stderr] + [Path(p) for p in other_paths]
             )
-            for file_name, file_content in optional_dump:
-                with open(outdir / file_name, "w") as dump:
+            self._allowed_paths.extend(
+                [Path(path)] for _, path in optional_dump
+            )
+            for file_content, file_path in optional_dump:
+                with open(file_path, "w") as dump:
                     dump.write(file_content)
             return pid
-        except:
+        except Exception as e:
             return -1
 
     def exposed_kill_job(self, pid: int) -> bool:

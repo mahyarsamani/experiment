@@ -19,6 +19,13 @@ import threading, time
 from typing import List
 from urllib.parse import quote
 
+status_color = {
+    "pending": "#F59E0B",
+    "running": "#10B981",
+    "killed": "#EF4444",
+    "exited": "#6B7280",
+}
+
 
 class DashboardServer:
     def __init__(self, title: str, host: str, port: int) -> None:
@@ -105,8 +112,8 @@ class DashboardServer:
                     JobView(
                         job.id(),
                         job.experiment().name(),
-                        job.status().value,
-                        job.status().color(),
+                        job.status(),
+                        status_color.get(job.status(), "#0000FF"),
                         no_host.name(),
                         tuple(links),
                     )
@@ -121,8 +128,8 @@ class DashboardServer:
                         JobView(
                             job.id(),
                             job.experiment().name(),
-                            job.status().value,
-                            job.status().color(),
+                            job.status(),
+                            status_color.get(job.status(), "#0000FF"),
                             host.name(),
                             tuple(links),
                         )

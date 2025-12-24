@@ -182,6 +182,35 @@ class gem5FSSimulation(Job):
         keyword_args = " ".join(keyword_items)
         return f"{gem5_path} --outdir={outdir} {run_script_path} {positional_args} {keyword_args}".strip()
 
+    def write_constructor(
+        demand: int, run_script_path: Path, *_args, **_kwargs
+    ) -> str:
+        args = ""
+        for arg in _args:
+            if isinstance(arg, str):
+                args += f'    "{arg}",\n'
+            elif isinstance(arg, Path):
+                args += f'    Path("{arg}"),\n'
+            else:
+                args += f"    {arg},\n"
+        kwargs = ""
+        for key, val in _kwargs.items():
+            if isinstance(val, str):
+                kwargs += f'    {key}="{val}",\n'
+            elif isinstance(val, Path):
+                kwargs += f'    {key}=Path("{val}"),\n'
+            else:
+                kwargs += f"    {key}={val},\n"
+        return f"""
+job = gem5FSSimulation(
+    getExperiment(),
+    {demand},
+    Path("{run_script_path.as_posix()}"),
+{args}
+{kwargs}
+)
+"""
+
     def __init__(
         self,
         experiment: "gem5Experiment",
@@ -207,41 +236,23 @@ class gem5FSSimulation(Job):
             outdir,
             demand,
             id,
-            [
+            aux_file_io=[
                 ("stats", outdir / "stats.txt"),
                 ("terminal", outdir / "board.terminal"),
-                ("constructor", outdir / "constructor.py"),
+            ],
+            optional_dump=[
+                (
+                    "constructor",
+                    gem5FSSimulation.write_constructor(
+                        demand, run_script_path, *args, **kwargs
+                    ),
+                    outdir / "constructor.py",
+                )
             ],
         )
         self._run_script_path = run_script_path
         self._args = args
         self._kwargs = kwargs
-
-    def optional_dump(self) -> List[Tuple[str, str]]:
-        return [("constructor.py", self._write_constructor())]
-
-    def _write_constructor(self) -> str:
-        args = ""
-        for arg in self._args:
-            if isinstance(arg, str):
-                args += f'\t"{arg}",\n'
-            else:
-                args += f"\t{arg},\n"
-        kwargs = ""
-        for key, val in self._kwargs:
-            if isinstance(val, str):
-                kwargs += f'\t{key}="{val}",\n'
-            else:
-                kwargs += f"\t{key}={val},\n"
-        return f"""
-job = gem5FSSimulation(
-    getExperiment(),
-    {self._demand},
-    Path({self._run_script_path.as_posix()}),
-{args}
-{kwargs}
-)
-"""
 
     def id_dict(self) -> Dict:
         return {
