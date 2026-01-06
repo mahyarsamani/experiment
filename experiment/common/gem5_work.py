@@ -1,13 +1,13 @@
-from ..api.work import Job, Experiment, ProjectConfiguration
-
 import platform
 
 from argparse import Namespace
 from enum import Enum
 from hashlib import sha256
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 from warnings import warn
+
+from ..api.work import Job, Experiment, ProjectConfiguration
 
 
 def _is_valid(args, attr):
@@ -169,18 +169,47 @@ class OtherValues(Enum):
 
 
 class gem5FSSimulation(Job):
-    def make_command(
-        gem5_path, outdir, run_script_path: Path, *args, **kwargs
-    ) -> str:
-        positional_args = " ".join(map(str, args))
+    def stringify_args(*args, **kwargs):
+        positional_args = [
+            Path(*arg.parts[-2:]) if isinstance(arg, Path) else arg
+            for arg in args
+        ]
+        args_string = " ".join(map(str, positional_args))
+
+        keyword_args = [
+            (
+                (key, Path(*val.parts[-2:]))
+                if isinstance(val, Path)
+                else (key, val)
+            )
+            for key, val in kwargs.items()
+        ]
         keyword_items = []
-        for key, value in kwargs.items():
+        for key, value in keyword_args:
             if isinstance(value, OtherValues) and not value.has_value(value):
                 keyword_items += [f"--{key.replace('_', '-')}"]
             else:
                 keyword_items += [f"--{key.replace('_', '-')} {value}"]
-        keyword_args = " ".join(keyword_items)
+        kwargs_string = " ".join(keyword_items)
+
+        return args_string, kwargs_string
+
+    def make_command(
+        gem5_path: Path, outdir: Path, run_script_path: Path, *args, **kwargs
+    ) -> str:
+        positional_args, keyword_args = gem5FSSimulation.stringify_args(
+            *args, **kwargs
+        )
         return f"{gem5_path} --outdir={outdir} {run_script_path} {positional_args} {keyword_args}".strip()
+
+    def make_shorthand_command(
+        gem5_path: Path, outdir: Path, run_script_path: Path, *args, **kwargs
+    ) -> str:
+        positional_args, keyword_args = gem5FSSimulation.stringify_args(
+            *args, **kwargs
+        )
+        shorthand = Path(*gem5_path.parts[-2:])
+        return f"{shorthand} {run_script_path.name} {positional_args} {keyword_args}".strip()
 
     def write_constructor(
         demand: int, run_script_path: Path, *_args, **_kwargs
@@ -193,6 +222,7 @@ class gem5FSSimulation(Job):
                 args += f'    Path("{arg}"),\n'
             else:
                 args += f"    {arg},\n"
+        args = args.strip()
         kwargs = ""
         for key, val in _kwargs.items():
             if isinstance(val, str):
@@ -201,13 +231,14 @@ class gem5FSSimulation(Job):
                 kwargs += f'    {key}=Path("{val}"),\n'
             else:
                 kwargs += f"    {key}={val},\n"
+        kwargs = kwargs.strip()
         return f"""
 job = gem5FSSimulation(
     getExperiment(),
     {demand},
     Path("{run_script_path.as_posix()}"),
-{args}
-{kwargs}
+    {args}
+    {kwargs}
 )
 """
 
@@ -229,10 +260,14 @@ job = gem5FSSimulation(
         command = gem5FSSimulation.make_command(
             experiment.gem5_path(), outdir, run_script_path, *args, **kwargs
         )
+        shorthand_command = gem5FSSimulation.make_shorthand_command(
+            experiment.gem5_path(), outdir, run_script_path, *args, **kwargs
+        )
         super().__init__(
-            experiment,
+            experiment.name(),
             experiment.cwd(),
             command,
+            shorthand_command,
             outdir,
             demand,
             id,
@@ -253,13 +288,6 @@ job = gem5FSSimulation(
         self._run_script_path = run_script_path
         self._args = args
         self._kwargs = kwargs
-
-    def id_dict(self) -> Dict:
-        return {
-            "run_script_path": self._run_script_path.as_posix(),
-            "args": [str(arg) for arg in self._args],
-            "kwargs": {key: str(value) for key, value in self._kwargs.items()},
-        }
 
 
 class gem5Experiment(Experiment):

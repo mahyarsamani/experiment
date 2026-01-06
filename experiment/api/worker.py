@@ -1,6 +1,6 @@
 import os
 import psutil
-import signal
+
 import subprocess
 import time
 
@@ -28,7 +28,7 @@ def _safe_route(app: Flask, rule: str):
         def wrapper(*a, **kw):
             try:
                 return func(*a, **kw)
-            except Exception:
+            except Exception as e:
                 from flask import abort
 
                 abort(500)
@@ -72,12 +72,12 @@ class Worker(Service):
 
             raw = request.args.get("path", "")
             if not raw:
-                abort(400, "missing ?path")
+                abort(400, "Missing ?path")
             p = Path(raw)
             if not p.is_absolute():
                 abort(400, "path must be absolute")
             if not _is_allowed(p):
-                abort(403, "path not allowed")
+                abort(403, f"path {p} not allowed")
             if not p.exists() or not p.is_file():
                 abort(404)
             # Rely on send_file to stream efficiently
@@ -136,7 +136,7 @@ class Worker(Service):
                 [stdout, stderr] + [Path(p) for p in other_paths]
             )
             self._allowed_paths.extend(
-                [Path(path)] for _, path in optional_dump
+                [Path(path) for _, path in optional_dump]
             )
             for file_content, file_path in optional_dump:
                 with open(file_path, "w") as dump:
@@ -145,12 +145,13 @@ class Worker(Service):
         except Exception as e:
             return -1
 
-    def exposed_kill_job(self, pid: int) -> bool:
-        try:
-            os.kill(pid, 9)
-        except ProcessLookupError:
+    def exposed_kill_job(self, pid: int, signal: int) -> bool:
+        if pid <= 1:
             return False
-        except:
+        try:
+            os.killpg(pid, signal)
+        except Exception as e:
+            print(e)
             return False
 
         return True

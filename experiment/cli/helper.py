@@ -1,5 +1,6 @@
-from ..common.config_util import _get_project_config
 import argparse
+
+from ..common.config_util import _get_project_config
 
 
 def main_function():

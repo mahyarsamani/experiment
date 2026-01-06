@@ -1,3 +1,5 @@
+import argparse
+
 from ..common.config_util import initialize_directories
 from ..common.gem5_work import (
     ISA,
@@ -5,8 +7,6 @@ from ..common.gem5_work import (
     BinaryOpt,
     gem5ProjectConfiguration,
 )
-
-import argparse
 
 
 def parse_initialize_args(args):

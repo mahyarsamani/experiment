@@ -1,10 +1,3 @@
-from . import assets
-from .cmd_util import run_command
-from .gem5_work import (
-    gem5BuildConfiguration,
-    gem5ProjectConfiguration,
-)
-
 import json
 import os
 import shutil
@@ -14,6 +7,13 @@ from git import Repo
 from importlib.resources import files
 from pathlib import Path
 from warnings import warn
+
+from . import assets
+from .cmd_util import run_command
+from .gem5_work import (
+    gem5BuildConfiguration,
+    gem5ProjectConfiguration,
+)
 
 config_file_name = "project_config.json"
 gem5_repo_url = "https://github.com/gem5/gem5.git"

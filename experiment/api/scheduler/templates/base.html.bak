@@ -15,8 +15,8 @@
   <div class="wrap">
     <div class="card">
       <div class="table-head row">
-        <div>Job ID</div>
-        <div>Experiment / Links</div>
+        <div>Experiment</div>
+        <div>Job Command / Links</div>
         <div>Host</div>
         <div>Status</div>
       </div>
@@ -40,9 +40,9 @@
       hostsEl.textContent = state.hosts.join(', ');
       jobsEl.innerHTML = state.jobs.map(j => `
         <div class="row">
-          <div class="kbd">${j.job_id}</div>
+          <div class="kbd" style="margin-bottom:6px;">${j.experiment}</div>
           <div>
-            <div class="kbd" style="margin-bottom:6px;">${j.experiment}</div>
+            <div class="kbd">${j.command}</div>
             <div class="links">${j.links.map(l => `<a href="${l.href}" target="_blank" rel="noopener">${l.label}</a>`).join('')}</div>
           </div>
           <div><span class="pill">${j.host}</span></div>

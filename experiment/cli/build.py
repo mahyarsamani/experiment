@@ -1,3 +1,5 @@
+import argparse
+
 from ..common.cmd_util import run_command
 from ..common.config_util import configure_build_directory
 from ..common.gem5_work import (
@@ -6,8 +8,6 @@ from ..common.gem5_work import (
     ISA,
     Protocol,
 )
-
-import argparse
 
 
 def parse_build_args(args):

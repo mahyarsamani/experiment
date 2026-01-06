@@ -1,8 +1,8 @@
-from ..api.worker import Worker
-
 import argparse
 
 from rpyc.utils.server import ThreadedServer
+
+from ..api.worker import Worker
 
 
 def parse_work_args(args):

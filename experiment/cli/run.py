@@ -1,13 +1,13 @@
+import argparse
+
+from pathlib import Path
+from warnings import warn
+
 from ..common.cmd_util import run_command
 from ..common.gem5_work import (
     BinaryOpt,
     gem5BuildConfiguration,
 )
-
-import argparse
-
-from pathlib import Path
-from warnings import warn
 
 
 def parse_run_args(args):

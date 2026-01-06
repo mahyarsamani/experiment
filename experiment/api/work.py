@@ -1,16 +1,63 @@
-import psutil
+from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Tuple, Union
+
+
+NO_HOST = "TBD"
+
+
+class JobStatus(Enum):
+    NONE = "none"
+    PENDING = "pending"
+    RUNNING = "running"
+    EXITED = "exited"
+    KILLED = "killed"
+    FAILED = "failed"
+
+    def color(self) -> str:
+        return {
+            "none": "#FAFAFA",
+            "pending": "#F59E0B",
+            "running": "#10B981",
+            "exited": "#6B7280",
+            "killed": "#090A0D",
+            "failed": "#EF4444",
+        }[self.value]
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True)
+class LinkView:
+    label: str
+    href: str
+
+
+@dataclass(frozen=True)
+class JobView:
+    # NOTE: Meta-Data, not viewable
+    id: str
+    pid: int
+    # NOTE: Viewable
+    experiment: str
+    command: str
+    links: Tuple[LinkView, ...]
+    host: str
+    status: str
+    status_color: str
 
 
 class Job:
     def __init__(
         self,
-        experiment: "Experiment",
+        experiment: str,
         cwd: Path,
         command: str,
+        shorthand_command: str,
         outdir: Path,
         demand: int,
         id: str,
@@ -24,11 +71,12 @@ class Job:
         # These attributes are useful for Worker from worker.py
         self._cwd = cwd
         self._command = command
+        self._shorthand_command = shorthand_command
         self._outdir = outdir
         self._stdout = self._outdir / "stdout"
         self._stderr = self._outdir / "stderr"
         self._pid = -1
-        self._status = "pending"
+        self._status = JobStatus.NONE
 
         # NOTE: Scheduling and managing a job
         self._demand = demand
@@ -38,7 +86,11 @@ class Job:
         self._optional_dump = optional_dump
         self._aux_file_io = aux_file_io
 
-    def experiment(self) -> "Experiment":
+        # NOTE: Will be set at launch
+        self._host_name = NO_HOST
+        self._links = list()
+
+    def experiment(self) -> str:
         return self._experiment
 
     def cwd(self) -> Path:
@@ -47,8 +99,14 @@ class Job:
     def command(self) -> str:
         return self._command
 
+    def shorthand_command(self) -> str:
+        return self._shorthand_command
+
     def outdir(self):
         return self._outdir
+
+    def id(self) -> str:
+        return self._id
 
     def stdout(self) -> Path:
         return self._stdout
@@ -59,26 +117,32 @@ class Job:
     def demand(self) -> int:
         return self._demand
 
-    def id(self) -> str:
-        return self._id
-
-    def set_status(self, status: str) -> None:
-        self._status = status
+    def set_status(self, status: Union[JobStatus, str]) -> None:
+        self._status = JobStatus(status)
 
     def status(self) -> str:
         return self._status
 
     def running(self) -> bool:
-        return self._status == "running"
-
-    def exited(self) -> bool:
-        return self._status == "exited"
+        return (
+            self._status == JobStatus.RUNNING
+            or self._status == JobStatus.PENDING
+        )
 
     def set_pid(self, pid: int) -> None:
         self._pid = pid
 
     def pid(self) -> int:
         return self._pid
+
+    def clear(self) -> bool:
+        if self.running():
+            return False
+        self._status = JobStatus.NONE
+        self._pid = -1
+        self._host = NO_HOST
+        self._links = list()
+        return True
 
     def file_io(self) -> List[Tuple[str, Path]]:
         return (
@@ -96,57 +160,29 @@ class Job:
     def optional_dump(self) -> List[Tuple[str, Path]]:
         return self._optional_dump
 
-    def id_dict(self) -> Dict:
-        raise NotImplementedError
+    def set_links(self, host_name: str, links: List[Tuple[str, str]]):
+        self._host_name = host_name
+        self._links = links
 
-    def serialize(self) -> Dict:
-        return {
-            "cwd": self._cwd.as_posix(),
-            "command": self._command,
-            "outdir": self._outdir.as_posix(),
-            "demand": self._demand,
-            "id": self._id,
-            "aux_file_io": [
-                (name, path.as_posix()) for name, path in self._aux_file_io
-            ],
-            "optional_dump": [
-                (name, content, path.as_posix())
-                for name, content, path in self._optional_dump
-            ],
-        }
-
-    @classmethod
-    def deserialize(
-        cls, experiment: "Experiment", serialized_job: Dict
-    ) -> "Job":
-        cwd = Path(serialized_job["cwd"])
-        command = serialized_job["command"]
-        outdir = Path(serialized_job["outdir"])
-        demand = serialized_job["demand"]
-        id = serialized_job["id"]
-        aux_file_io = [
-            (name, Path(path)) for name, path in serialized_job["aux_file_io"]
-        ]
-        optional_dump = [
-            (name, content, Path(path))
-            for name, content, path in serialized_job["optional_dump"]
-        ]
-
-        job = cls(
-            experiment,
-            cwd,
-            command,
-            outdir,
-            demand,
-            id,
-            aux_file_io=aux_file_io,
-            optional_dump=optional_dump,
+    def view(self):
+        return JobView(
+            id=self._id,
+            pid=self._pid,
+            experiment=self._experiment,
+            command=self._shorthand_command,
+            links=tuple(
+                LinkView(label=label, href=href) for label, href in self._links
+            ),
+            host=self._host_name,
+            status=str(self._status),
+            status_color=self._status.color(),
         )
 
-        return job
-
     def __str__(self):
-        return f"{__class__.__name__}(cwd={self._cwd}, command={self._command}, outdir={self._outdir}, status={self._status}, pid={self._pid})"
+        return f"{self.__class__.__name__}(cwd={self._cwd}, command={self._command}, outdir={self._outdir}, status={self._status}, pid={self._pid})"
+
+    def __repr__(self):
+        return self.__str__()
 
 
 class Experiment:
@@ -155,7 +191,8 @@ class Experiment:
         self._outdir = outdir
 
         self._jobs = list()
-        self._next_job_index = 0
+
+        self._safe_to_remove = False
 
     def name(self) -> str:
         return self._name
@@ -170,29 +207,30 @@ class Experiment:
         self._jobs.sort(key=lambda j: j.demand(), reverse=True)
         return self._jobs
 
-    def serialize(self) -> Dict:
-        return {
-            "name": self._name,
-            "outdir": self._outdir.as_posix(),
-            "jobs": [job.serialize() for job in self._jobs],
-        }
+    def set_safe_to_remove(self, safe_to_remove: bool):
+        self._safe_to_remove = safe_to_remove
 
-    @classmethod
-    def deserialize(cls, serialized_experiment: Dict) -> "Experiment":
-        name = serialized_experiment["name"]
-        outdir = Path(serialized_experiment["outdir"])
-        experiment = cls(name, outdir)
+    def safe_to_remove(self) -> bool:
+        return self._safe_to_remove
 
-        for job_dict in serialized_experiment["jobs"]:
-            job = Job.deserialize(experiment, job_dict)
-            experiment.register_job(job)
+    def candidate(self, capacity: int):
+        candidates = sorted(
+            (
+                job
+                for job in self._jobs
+                if job.status() == JobStatus.NONE and job.demand() <= capacity
+            ),
+            reverse=True,
+            key=lambda j: j.demand(),
+        )
 
-        return experiment
+        return candidates[0] if len(candidates) > 0 else None
 
     def __str__(self) -> str:
-        return (
-            f"{__class__.__name__}(name={self._name}, outdir={self._outdir})"
-        )
+        return f"{self.__class__.__name__}(name={self._name}, outdir={self._outdir}, jobs: {len(self._jobs)})"
+
+    def __repr__(self):
+        return self.__str__()
 
 
 class ProjectConfiguration:

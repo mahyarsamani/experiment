@@ -1,0 +1,216 @@
+<!-- templates/base.html -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ title }}</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1 id="title">{{ title }}</h1>
+    <div class="small">Last update: <span id="lu">—</span></div>
+  </header>
+
+  <div class="wrap">
+    <div class="card">
+      <div class="table-head row">
+        <div>Experiment</div>
+        <div>Job Command / Links</div>
+        <div>Host</div>
+        <div>Status</div>
+        <div>Action</div>
+      </div>
+      <div id="jobs"></div>
+    </div>
+
+    <div class="small" style="margin-top:8px;">Hosts: <span id="hosts"></span></div>
+  </div>
+
+  <!-- Toast bubble -->
+  <div id="toast" class="toast hidden"></div>
+
+  <script>
+    const jobsEl = document.getElementById('jobs');
+    const luEl = document.getElementById('lu');
+    const hostsEl = document.getElementById('hosts');
+    const toastEl = document.getElementById('toast');
+
+    let toastTimer = null;
+
+    function showToast(msg, kind = "error", ms = 3500) {
+      if (!toastEl) return;
+      toastEl.textContent = msg;
+      toastEl.classList.remove("hidden", "error", "ok");
+      toastEl.classList.add(kind);
+
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => toastEl.classList.add("hidden"), ms);
+    }
+
+    function fmtTime(epoch) {
+      return new Date(epoch * 1000).toLocaleString();
+    }
+
+    function isRunningJob(j) {
+      return ((j.status || "").toLowerCase() === "running") || ((j.status || "").toLowerCase() === "pending");
+    }
+
+    function canReset(j) {
+        return !isRunningJob(j) && (j.status || "").toLowerCase() !== "none";
+    }
+    // job_id -> { pid: number, experiment: string, host: string, running: bool }
+    const jobMetaById = new Map();
+
+    function render(state) {
+      luEl.textContent = state.last_update_epoch ? fmtTime(state.last_update_epoch) : '—';
+      hostsEl.textContent = (state.hosts || []).join(', ');
+
+      jobMetaById.clear();
+
+      jobsEl.innerHTML = (state.jobs || []).map((j) => {
+        const jobId = String(j.id ?? "");
+        const pidNum = Number(j.pid);
+        const running = isRunningJob(j);
+        const resetable = canReset(j);
+
+        jobMetaById.set(jobId, {
+          pid: pidNum,
+          experiment: j.experiment ?? "",
+          host: j.host ?? "",
+          running,
+        });
+
+        const sigDisabledAttr = running ? "" : "disabled";
+        const resDisabledAttr = resetable ? "" : "disabled";
+
+        return `
+          <div class="row" data-job-id="${jobId}">
+            <div class="kbd" style="margin-bottom:6px;">${j.experiment}</div>
+
+            <div>
+              <div class="kbd">${j.command}</div>
+              <div class="links">
+                ${(j.links || []).map(l =>
+                  `<a href="${l.href}" target="_blank" rel="noopener">${l.label}</a>`
+                ).join('')}
+              </div>
+            </div>
+
+            <div><span class="pill">${j.host}</span></div>
+
+            <div class="status">
+              <span class="dot" style="background:${j.status_color}"></span>${j.status}
+            </div>
+
+            <div class="actions">
+
+              <!-- Row 1 -->
+              <!-- <button class="sig-btn danger" data-sig="term" ${sigDisabledAttr} title="SIGTERM (15)">TERM</button> -->
+              <!-- <button class="sig-btn danger" data-sig="int"  ${sigDisabledAttr} title="SIGINT (2)">INT</button> -->
+              <!-- <button class="sig-btn danger" data-sig="quit" ${sigDisabledAttr} title="SIGQUIT (3)">QUIT</button> -->
+
+              <!-- Row 2 -->
+              <button class="sig-btn danger" data-sig="kill" ${sigDisabledAttr} title="SIGKILL (9)">KILL</button>
+              <button class="sig-btn" data-sig="reset" ${resDisabledAttr} title="RESET">RESET</button>
+            </div>
+          </div>`;
+      }).join('');
+    }
+
+    async function postAction(payload) {
+      const r = await fetch("/api/job_action", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      let body = null;
+      try { body = await r.json(); } catch (_) {}
+
+      if (!r.ok) {
+        const msg = (body && body.error) ? body.error : (r.statusText || `HTTP ${r.status}`);
+        throw new Error(msg);
+      }
+      return body || {};
+    }
+
+    jobsEl.addEventListener('click', async (ev) => {
+      const sigBtn = ev.target.closest('.sig-btn');
+      if (!sigBtn) return;
+
+      if (sigBtn.disabled) return;
+
+      const row = sigBtn.closest('.row');
+      const job_id = String(row.dataset.jobId || "");
+      const meta = jobMetaById.get(job_id);
+
+      if (!job_id || !meta || !Number.isFinite(meta.pid)) {
+        showToast("Missing job metadata; refresh and try again.", "error", 4500);
+        return;
+      }
+
+      const pid = meta.pid;
+      const experiment = meta.experiment;
+      const host = meta.host;
+
+      let payload = null;
+
+      const signal = sigBtn.dataset.sig;
+
+      if (!meta.running && signal !== 'reset') return;
+
+      // Extra confirmation for SIGKILL
+      if (signal === "KILL") {
+        const ok = confirm(
+          `Send SIGKILL to ${experiment} @ ${host}\n(job ${job_id}, pid ${pid})?\nThis is immediate.`
+        );
+        if (!ok) return;
+      }
+
+      payload = { signal, job_id, pid, experiment, host };
+
+
+      // Disable row controls while request is in flight
+      const rowButtons = Array.from(row.querySelectorAll("button"));
+      rowButtons.forEach(b => b.disabled = true);
+
+      try {
+        const res = await postAction(payload);
+
+        // Backend echoes what it received; fall back to payload if needed
+        const rec = res.received || payload;
+
+        const msg = `Server received: ${rec.experiment} @ ${rec.host} (job ${rec.job_id}, pid ${rec.pid}) → ${rec.signal}`
+
+        showToast(msg, "ok", 2600);
+      } catch (e) {
+        console.error(e);
+        showToast(`Action failed: ${e.message}`, "error", 5000);
+      } finally {
+        rowButtons.forEach(b => b.disabled = false);
+
+        // Re-apply “signals disabled unless running” on this row
+        const fresh = jobMetaById.get(job_id);
+        const runningNow = fresh ? fresh.running : false;
+        row.querySelectorAll(".sig-btn").forEach(b => b.disabled = !runningNow);
+      }
+    });
+
+    async function tick() {
+      try {
+        const r = await fetch('/api/state', { cache: 'no-store' });
+        const s = await r.json();
+        render(s);
+      } catch (e) {
+        console.error(e);
+        showToast("Failed to fetch /api/state", "error", 3000);
+      }
+    }
+
+    setInterval(tick, 2000);
+    window.addEventListener('load', tick);
+  </script>
+</body>
+</html>

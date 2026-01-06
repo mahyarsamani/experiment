@@ -11,7 +11,7 @@ setup(
     packages=find_packages(),
     package_data={
         "experiment.common": ["assets/*.py"],
-        "experiment.api.dashboard": ["templates/*.html", "static/*.css"],
+        "experiment.api.scheduler": ["templates/*.html", "static/*.css"],
     },
     entry_points={
         "console_scripts": ["helper = experiment.cli.helper:main_function"]
