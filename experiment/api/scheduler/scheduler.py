@@ -668,7 +668,9 @@ class Scheduler:
                     )
 
                     signal = Scheduler.JobSignal(req.signal)
-                    if signal is None or signal.verify(experiment, job, host):
+                    if signal is None or not signal.verify(
+                        experiment, job, host
+                    ):
                         message = (
                             f"Couldn't handle signal for experiment {req.experiment}, job {req.job_id}, host {req.host} with pid {req.pid} and signal {req.signal}.\n"
                             f"Found experiment: {experiment}, job: {job}, host: {host}, signal {signal}."
