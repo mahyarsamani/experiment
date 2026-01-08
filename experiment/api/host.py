@@ -95,6 +95,9 @@ class Host(Human):
     def max_capacity(self) -> int:
         return self._max_capacity
 
+    def upgrade(self, additional_capacity: int) -> None:
+        self._max_capacity += additional_capacity
+
     def capacity(self) -> int:
         return self._max_capacity - sum(
             [
@@ -109,7 +112,6 @@ class Host(Human):
             ret = func(*args, **kwargs)
             return Success(ret)
         except Exception as e:
-            print(f"failed at {func.__name__}")
             self._fail()
             return Failure(f"{self._name}::{func.__name__}", e)
 
@@ -176,7 +178,7 @@ class Host(Human):
             self._running_jobs[job.experiment()].remove(job)
             return True
         else:
-            raise RuntimeError("Worker failed to kill job.")
+            raise RuntimeError(f"{self._name} failed to kill {job}.")
 
     def kill_job(self, job: Job, signal: int) -> Result:
         return self._fail_gracefully(self._kill_job, job, signal)
@@ -193,16 +195,17 @@ class Host(Human):
     def update(self) -> Result:
         return self._fail_gracefully(self._update)
 
-    def kill_experiment(self, experiment: Experiment) -> Result:
-        all_ok = True
+    def _kill_experiment(self, experiment: Experiment) -> Result:
+        if experiment.name() not in self._running_jobs:
+            True
+
         for job in self._running_jobs[experiment.name()]:
-            if not (res := self.kill_job(job, 9)).ok():
-                all_ok = False
-        return (
-            Success(True)
-            if all_ok
-            else Failure("kill_experiment", ConnectionError())
-        )
+            self._kill_job(job, 9)
+
+        return True
+
+    def kill_experiment(self, experiment: Experiment) -> Result:
+        return self._fail_gracefully(self._kill_experiment, experiment)
 
     def idle(self):
         return sum([len(jobs) for _, jobs in self._running_jobs.items()]) == 0

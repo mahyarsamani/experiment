@@ -6,6 +6,18 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{{ title }}</title>
   <link rel="stylesheet" href="/static/style.css" />
+  <style>
+    .table-head > div[data-sort-by] {
+      cursor: pointer;
+      user-select: none;
+    }
+    .sort-asc::after {
+      content: ' ▲';
+    }
+    .sort-desc::after {
+      content: ' ▼';
+    }
+  </style>
 </head>
 <body>
   <header>
@@ -15,11 +27,11 @@
 
   <div class="wrap">
     <div class="card">
-      <div class="table-head row">
-        <div>Experiment</div>
+      <div class="table-head row" id="table-head">
+        <div data-sort-by="experiment">Experiment</div>
         <div>Job Command / Links</div>
-        <div>Host</div>
-        <div>Status</div>
+        <div data-sort-by="host">Host</div>
+        <div data-sort-by="status">Status</div>
         <div>Action</div>
       </div>
       <div id="jobs"></div>
@@ -34,6 +46,7 @@
   <script>
     const jobsEl = document.getElementById('jobs');
     const luEl = document.getElementById('lu');
+    const tableHeadEl = document.getElementById('table-head');
     const hostsEl = document.getElementById('hosts');
     const toastEl = document.getElementById('toast');
 
@@ -60,6 +73,10 @@
     function canReset(j) {
         return !isRunningJob(j) && (j.status || "").toLowerCase() !== "none";
     }
+
+    let sortState = { key: 'experiment', asc: true };
+    let lastState = null;
+
     // job_id -> { pid: number, experiment: string, host: string, running: bool }
     const jobMetaById = new Map();
 
@@ -67,9 +84,27 @@
       luEl.textContent = state.last_update_epoch ? fmtTime(state.last_update_epoch) : '—';
       hostsEl.textContent = (state.hosts || []).join(', ');
 
+      const jobs = state.jobs || [];
+
+      // Sort jobs
+      jobs.sort((a, b) => {
+        const valA = String(a[sortState.key] || '').toLowerCase();
+        const valB = String(b[sortState.key] || '').toLowerCase();
+        const comparison = valA.localeCompare(valB, undefined, { numeric: true });
+        return sortState.asc ? comparison : -comparison;
+      });
+
+      // Update sort indicators in headers
+      tableHeadEl.querySelectorAll('[data-sort-by]').forEach(th => {
+        th.classList.remove('sort-asc', 'sort-desc');
+        if (th.dataset.sortBy === sortState.key) {
+          th.classList.add(sortState.asc ? 'sort-asc' : 'sort-desc');
+        }
+      });
+
       jobMetaById.clear();
 
-      jobsEl.innerHTML = (state.jobs || []).map((j) => {
+      jobsEl.innerHTML = jobs.map((j) => {
         const jobId = String(j.id ?? "");
         const pidNum = Number(j.pid);
         const running = isRunningJob(j);
@@ -198,11 +233,29 @@
       }
     });
 
+    tableHeadEl.addEventListener('click', (ev) => {
+      const header = ev.target.closest('[data-sort-by]');
+      if (!header) return;
+
+      const key = header.dataset.sortBy;
+      if (sortState.key === key) {
+        sortState.asc = !sortState.asc;
+      } else {
+        sortState.key = key;
+        sortState.asc = true;
+      }
+
+      if (lastState) {
+        render(lastState);
+      }
+    });
+
     async function tick() {
       try {
         const r = await fetch('/api/state', { cache: 'no-store' });
         const s = await r.json();
-        render(s);
+        lastState = s;
+        render(lastState);
       } catch (e) {
         console.error(e);
         showToast("Failed to fetch /api/state", "error", 3000);

@@ -140,7 +140,7 @@ class Job:
             return False
         self._status = JobStatus.NONE
         self._pid = -1
-        self._host = NO_HOST
+        self._host_name = NO_HOST
         self._links = list()
         return True
 

@@ -6,7 +6,6 @@ import requests
 import shlex
 import time
 
-
 from dataclasses import dataclass
 from enum import Enum
 from flask import (
@@ -20,6 +19,8 @@ from flask import (
 )
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from prompt_toolkit import prompt
+from prompt_toolkit.history import FileHistory
 from queue import Queue
 from threading import RLock, Thread
 from typing import Any, Dict, List, Iterable
@@ -63,6 +64,13 @@ class Scheduler:
                 self.KILL: 9,
                 self.RESET: -1,
             }[self]
+
+        def verify(self, experiment: Experiment, job: Job, host: Host):
+            if experiment is None or job is None:
+                return False
+            if self.signal_value() != -1 and host is None:
+                return False
+            return True
 
         def handle(self, job: Job, host: Host) -> str:
             if self.signal_value() != -1:
@@ -496,6 +504,17 @@ class Scheduler:
                 self._hosts_pending_removal.append(to_kill)
                 self._hosts.remove(to_kill)
 
+    def _capacity(self, host_name: str, capacity: int) -> None:
+        with self._hosts_lock:
+            host = next(
+                (host for host in self._hosts if host.name() == host_name),
+                None,
+            )
+            if host is None:
+                console_error(f"{host_name} does not exist in self._hosts.")
+            else:
+                host.upgrade(capacity)
+
     def _run_console(self):
         def build_parser() -> argparse.ArgumentParser:
             parser = argparse.ArgumentParser(
@@ -504,26 +523,59 @@ class Scheduler:
             subparsers = parser.add_subparsers(dest="command", required=True)
 
             process_parser = subparsers.add_parser(
-                "process", aliases=["p"], exit_on_error=False
+                "process",
+                aliases=["p"],
+                exit_on_error=False,
+                help="Process a python script including "
+                "definiton of experiments and/or hosts.",
             )
             process_parser.add_argument(
-                "script", type=str, help="Path to python script to process."
+                "script",
+                type=str,
+                help="Path to python script to process.",
             )
 
             list_parser = subparsers.add_parser(
-                "list", aliases=["l"], exit_on_error=False
+                "list",
+                aliases=["l"],
+                exit_on_error=False,
+                help="List objects of the specified `kind`.",
             )
             list_parser.add_argument("kind", choices=["experiment", "host"])
 
             kill_parser = subparsers.add_parser(
-                "kill", aliases=["k"], exit_on_error=False
+                "kill",
+                aliases=["k"],
+                exit_on_error=False,
+                help="Kill object of type `kind` and specified `name`.",
             )
-            kill_parser.add_argument("kind", choices=["experiment", "host"])
+            kill_parser.add_argument(
+                "kind",
+                choices=["experiment", "host"],
+            )
             kill_parser.add_argument(
                 "name", help="Name of the object to kill."
             )
 
-            subparsers.add_parser("stop", exit_on_error=False)
+            capacity_parser = subparsers.add_parser(
+                "capacity",
+                aliases=["c"],
+                exit_on_error=False,
+                help="Modify the capacity of host `name` by `capacity`",
+            )
+            capacity_parser.add_argument(
+                "name", help="Name of the host whose capacity to modify."
+            )
+            capacity_parser.add_argument(
+                "capacity",
+                type=int,
+                help="New capacity of the host. "
+                "Use negative numbers to decrease capacity.",
+            )
+
+            subparsers.add_parser(
+                "stop", exit_on_error=False, help="Stop this scheduler."
+            )
 
             return parser
 
@@ -550,6 +602,8 @@ class Scheduler:
                     self._kill_experiment(args.name)
                 if args.kind == "host":
                     self._kill_host(args.name)
+            if args.command in ["capacity", "c"]:
+                self._capacity(args.name, args.capacity)
             if args.command == "stop":
                 self.stop()
 
@@ -558,7 +612,11 @@ class Scheduler:
 
         while not self._stop:
             try:
-                args = process_cmd(parser, input("> "))
+                line = prompt(
+                    "> ",
+                    history=FileHistory(f"{self._name}.console_history"),
+                )
+                args = process_cmd(parser, line)
                 if args is None:
                     continue
                 dispatch(args)
@@ -610,13 +668,7 @@ class Scheduler:
                     )
 
                     signal = Scheduler.JobSignal(req.signal)
-                    if (
-                        experiment is None
-                        or job is None
-                        or host is None
-                        or job.pid() != req.pid
-                        or signal is None
-                    ):
+                    if signal is None or signal.verify(experiment, job, host):
                         message = (
                             f"Couldn't handle signal for experiment {req.experiment}, job {req.job_id}, host {req.host} with pid {req.pid} and signal {req.signal}.\n"
                             f"Found experiment: {experiment}, job: {job}, host: {host}, signal {signal}."
