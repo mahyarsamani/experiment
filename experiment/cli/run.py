@@ -40,6 +40,12 @@ def parse_run_args(args):
         required=False,
     )
     parser.add_argument(
+        "--debug-file",
+        type=str,
+        help="File to output debug prints to.",
+        required=False,
+    )
+    parser.add_argument(
         "--debug-start",
         dest="debug_start",
         type=int,
@@ -112,6 +118,9 @@ def _process_run_args(proj_config, run_args, unknown_args):
         command += f" -re --outdir={outdir}"
     if run_args.debug_flags is not None:
         command += f" --debug-flags={run_args.debug_flags}"
+    if run_args.debug_file is not None:
+        debug_file = path_config.gem5_out_base_dir() / run_args.debug_file
+        command += f" --debug-file={debug_file}"
     if run_args.debug_start is not None:
         command += f" --debug-start={run_args.debug_start}"
     if run_args.debug_end is not None:
