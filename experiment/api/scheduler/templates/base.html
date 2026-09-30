@@ -73,22 +73,28 @@
     }
 
     function isRunningJob(j) {
-      return ((j.status || "").toLowerCase() === "running") || ((j.status || "").toLowerCase() === "pending");
+      return ["running", "launching", "unknown"].includes(j.status || "");
     }
 
     function canReset(j) {
-        return !isRunningJob(j) && (j.status || "").toLowerCase() !== "none";
+      return ["exited", "failed", "killed"].includes(j.status || "");
+    }
+
+    function fileHref(j, label) {
+      return `/files?job=${encodeURIComponent(j.id)}&label=${encodeURIComponent(label)}`;
     }
 
     let sortState = { key: 'experiment', asc: true };
     let lastState = null;
 
-    // job_id -> { pid: number, experiment: string, host: string, running: bool }
+    // job_id -> { experiment: string, host: string, running: bool }
     const jobMetaById = new Map();
 
     function render(state) {
       luEl.textContent = state.last_update_epoch ? fmtTime(state.last_update_epoch) : '—';
-      hostsEl.textContent = (state.hosts || []).join(', ');
+      hostsEl.textContent = (state.hosts || [])
+        .map(h => `${h.name} (${h.state}${h.mode !== "active" ? ", " + h.mode : ""}, ${h.used}/${h.capacity})`)
+        .join(', ');
 
       const jobs = state.jobs || [];
 
@@ -112,12 +118,10 @@
 
       jobsEl.innerHTML = jobs.map((j) => {
         const jobId = String(j.id ?? "");
-        const pidNum = Number(j.pid);
         const running = isRunningJob(j);
         const resetable = canReset(j);
 
         jobMetaById.set(jobId, {
-          pid: pidNum,
           experiment: j.experiment ?? "",
           host: j.host ?? "",
           running,
@@ -133,8 +137,8 @@
             <div>
               <div class="kbd">${esc(j.command)}</div>
               <div class="links">
-                ${(j.links || []).map(l =>
-                  `<a href="${esc(l.href)}" target="_blank" rel="noopener">${esc(l.label)}</a>`
+                ${(j.files || []).map(label =>
+                  `<a href="${esc(fileHref(j, label))}" target="_blank" rel="noopener">${esc(label)}</a>`
                 ).join('')}
               </div>
             </div>
@@ -142,7 +146,8 @@
             <div><span class="pill">${esc(j.host)}</span></div>
 
             <div class="status">
-              <span class="dot" style="background:${esc(j.status_color)}"></span>${esc(j.status)}
+              <span class="dot" style="background:${esc(j.status_color)}"></span>${esc(j.status)}${j.returncode !== null && j.returncode !== 0 ? ` (rc ${esc(j.returncode)})` : ""}
+              ${j.message ? `<div class="small">${esc(j.message)}</div>` : ""}
             </div>
 
             <div class="actions">
@@ -187,12 +192,11 @@
       const job_id = String(row.dataset.jobId || "");
       const meta = jobMetaById.get(job_id);
 
-      if (!job_id || !meta || !Number.isFinite(meta.pid)) {
+      if (!job_id || !meta) {
         showToast("Missing job metadata; refresh and try again.", "error", 4500);
         return;
       }
 
-      const pid = meta.pid;
       const experiment = meta.experiment;
       const host = meta.host;
 
@@ -205,12 +209,12 @@
       // Extra confirmation for SIGKILL
       if (signal === "kill") {
         const ok = confirm(
-          `Send SIGKILL to ${experiment} @ ${host}\n(job ${job_id}, pid ${pid})?\nThis is immediate.`
+          `Send SIGKILL to ${experiment} @ ${host}\n(job ${job_id.slice(0, 8)})?\nThis is immediate.`
         );
         if (!ok) return;
       }
 
-      payload = { signal, job_id, pid, experiment, host };
+      payload = { signal, job_id };
 
 
       // Disable row controls while request is in flight
@@ -220,12 +224,7 @@
       try {
         const res = await postAction(payload);
 
-        // Backend echoes what it received; fall back to payload if needed
-        const rec = res.received || payload;
-
-        const msg = `Server received: ${rec.experiment} @ ${rec.host} (job ${rec.job_id}, pid ${rec.pid}) → ${rec.signal}`
-
-        showToast(msg, "ok", 2600);
+        showToast(res.message || "Done.", "ok", 2600);
       } catch (e) {
         console.error(e);
         showToast(`Action failed: ${e.message}`, "error", 5000);
@@ -235,7 +234,7 @@
         // Re-apply “signals disabled unless running” on this row
         const fresh = jobMetaById.get(job_id);
         const runningNow = fresh ? fresh.running : false;
-        row.querySelectorAll(".sig-btn").forEach(b => b.disabled = !runningNow);
+        row.querySelectorAll('.sig-btn[data-sig="kill"]').forEach(b => b.disabled = !runningNow);
       }
     });
 
@@ -260,6 +259,10 @@
       try {
         const r = await fetch('/api/state', { cache: 'no-store' });
         const s = await r.json();
+        if (!r.ok) {
+          showToast(s.error || `HTTP ${r.status}`, "error", 5000);
+          return;
+        }
         lastState = s;
         render(lastState);
       } catch (e) {

@@ -1,14 +1,15 @@
 import json
 import platform
+import shlex
 
 from argparse import Namespace
 from enum import Enum
 from hashlib import sha256
 from pathlib import Path
 from typing import List, Optional
-from warnings import warn
 
 from ..api.work import Job, Experiment, ProjectConfiguration
+from .log import warn
 
 
 def _is_valid(args, attr):
@@ -171,79 +172,94 @@ class OtherValues(Enum):
             return "OtherValues.Store_Const"
 
 
-class gem5FSSimulation(Job):
-    def stringify_args(*args, **kwargs):
-        positional_args = [
-            Path(*arg.parts[-2:]) if isinstance(arg, Path) else arg
-            for arg in args
-        ]
-        args_string = " ".join(map(str, positional_args))
+def _literal(value) -> str:
+    """Python source that evaluates to `value` (for constructor.py)."""
+    if isinstance(value, Path):
+        return f"Path({str(value)!r})"
+    if isinstance(value, OtherValues):
+        return f"OtherValues.{value.name}"
+    return repr(value)
 
-        keyword_args = [
-            (
-                (key, Path(*val.parts[-2:]))
-                if isinstance(val, Path)
-                else (key, val)
-            )
-            for key, val in kwargs.items()
-        ]
-        keyword_items = []
-        for key, value in keyword_args:
+
+class gem5Job(Job):
+    """One gem5 run: `gem5 --outdir=<outdir> <script> <args> --<kwargs>`.
+
+    Positional args are passed as they are; each keyword argument becomes
+    `--key-name value` (or just `--key-name` for OtherValues.Store_Const).
+    """
+
+    @staticmethod
+    def _cli_args(args, kwargs, shorten: bool) -> list[str]:
+        def show(value) -> str:
+            if shorten and isinstance(value, Path):
+                return str(Path(*value.parts[-2:]))
+            return str(value)
+
+        words = [show(arg) for arg in args]
+        for key, value in kwargs.items():
+            flag = f"--{key.replace('_', '-')}"
             if isinstance(value, OtherValues) and not value.has_value(value):
-                keyword_items += [f"--{key.replace('_', '-')}"]
+                words.append(flag)
             else:
-                keyword_items += [f"--{key.replace('_', '-')} {value}"]
-        kwargs_string = " ".join(keyword_items)
+                words += [flag, show(value)]
+        return words
 
-        return args_string, kwargs_string
-
+    @staticmethod
     def make_command(
         gem5_path: Path, outdir: Path, run_script_path: Path, *args, **kwargs
     ) -> str:
-        positional_args, keyword_args = gem5FSSimulation.stringify_args(
-            *args, **kwargs
-        )
-        return f"{gem5_path} --outdir={outdir} {run_script_path} {positional_args} {keyword_args}".strip()
+        words = [
+            str(gem5_path),
+            f"--outdir={outdir}",
+            str(run_script_path),
+            *gem5Job._cli_args(args, kwargs, shorten=False),
+        ]
+        return shlex.join(words)
 
+    @staticmethod
     def make_shorthand_command(
-        gem5_path: Path, outdir: Path, run_script_path: Path, *args, **kwargs
+        gem5_path: Path, run_script_path: Path, *args, **kwargs
     ) -> str:
-        positional_args, keyword_args = gem5FSSimulation.stringify_args(
-            *args, **kwargs
-        )
-        shorthand = Path(*gem5_path.parts[-2:])
-        return f"{shorthand} {run_script_path.name} {positional_args} {keyword_args}".strip()
+        words = [
+            str(Path(*gem5_path.parts[-2:])),
+            run_script_path.name,
+            *gem5Job._cli_args(args, kwargs, shorten=True),
+        ]
+        return " ".join(words)
 
+    @staticmethod
     def write_constructor(
-        demand: int, run_script_path: Path, *_args, **_kwargs
+        experiment: "gem5Experiment",
+        demand: int,
+        run_script_path: Path,
+        *args,
+        **kwargs,
     ) -> str:
-        args = ""
-        for arg in _args:
-            if isinstance(arg, str):
-                args += f'    "{arg}",\n'
-            elif isinstance(arg, Path):
-                args += f'    Path("{arg}"),\n'
-            else:
-                args += f"    {arg},\n"
-        args = args.strip()
-        kwargs = ""
-        for key, val in _kwargs.items():
-            if isinstance(val, str):
-                kwargs += f'    {key}="{val}",\n'
-            elif isinstance(val, Path):
-                kwargs += f'    {key}=Path("{val}"),\n'
-            else:
-                kwargs += f"    {key}={val},\n"
-        kwargs = kwargs.strip()
-        return f"""
-job = gem5FSSimulation(
-    getExperiment(),
-    {demand},
-    Path("{run_script_path.as_posix()}"),
-    {args}
-    {kwargs}
-)
-"""
+        """Source for a script that recreates this job."""
+        call_args = [
+            "experiment",
+            repr(demand),
+            _literal(Path(run_script_path)),
+            *(_literal(arg) for arg in args),
+            *(f"{key}={_literal(value)}" for key, value in kwargs.items()),
+        ]
+        body = "".join(f"    {arg},\n" for arg in call_args)
+        return (
+            "from pathlib import Path\n\n"
+            "from experiment.common.gem5_work import (\n"
+            "    OtherValues,\n"
+            "    gem5Experiment,\n"
+            "    gem5Job,\n"
+            ")\n\n"
+            "experiment = gem5Experiment(\n"
+            f"    name={experiment.name()!r},\n"
+            f"    cwd={_literal(experiment.cwd())},\n"
+            f"    gem5_path={_literal(experiment.gem5_path())},\n"
+            f"    outdir={_literal(experiment.outdir())},\n"
+            ")\n"
+            f"job = gem5Job(\n{body})\n"
+            "experiment.register_job(job)\n"
+        )
 
     def __init__(
         self,
@@ -253,37 +269,42 @@ job = gem5FSSimulation(
         *args,
         **kwargs,
     ):
-        items = [
-            experiment.gem5_path(),
-            run_script_path,
-            list(args),
-            sorted(kwargs.items()),
-        ]
-        id = calculate_hash(items)
+        run_script_path = Path(run_script_path)
+        id = calculate_hash(
+            [
+                experiment.name(),
+                experiment.gem5_path(),
+                run_script_path,
+                list(args),
+                sorted(kwargs.items()),
+            ]
+        )
         outdir = experiment.outdir() / id
-        command = gem5FSSimulation.make_command(
-            experiment.gem5_path(), outdir, run_script_path, *args, **kwargs
-        )
-        shorthand_command = gem5FSSimulation.make_shorthand_command(
-            experiment.gem5_path(), outdir, run_script_path, *args, **kwargs
-        )
         super().__init__(
             experiment.name(),
             experiment.cwd(),
-            command,
-            shorthand_command,
+            gem5Job.make_command(
+                experiment.gem5_path(),
+                outdir,
+                run_script_path,
+                *args,
+                **kwargs,
+            ),
+            gem5Job.make_shorthand_command(
+                experiment.gem5_path(), run_script_path, *args, **kwargs
+            ),
             outdir,
             demand,
             id,
-            aux_file_io=[
+            aux_files=[
                 ("stats", outdir / "stats.txt"),
                 ("terminal", outdir / "board.terminal"),
             ],
-            optional_dump=[
+            dumps=[
                 (
                     "constructor",
-                    gem5FSSimulation.write_constructor(
-                        demand, run_script_path, *args, **kwargs
+                    gem5Job.write_constructor(
+                        experiment, demand, run_script_path, *args, **kwargs
                     ),
                     outdir / "constructor.py",
                 )
@@ -294,6 +315,10 @@ job = gem5FSSimulation(
         self._kwargs = kwargs
 
 
+# NOTE: Old name, kept so existing experiment scripts keep working.
+gem5FSSimulation = gem5Job
+
+
 class gem5Experiment(Experiment):
     def __init__(
         self,
@@ -302,9 +327,9 @@ class gem5Experiment(Experiment):
         gem5_path: Path,
         outdir: Path,
     ):
-        super().__init__(name, outdir)
-        self._cwd = cwd.resolve()
-        self._gem5_path = gem5_path.resolve()
+        super().__init__(name, Path(outdir).resolve())
+        self._cwd = Path(cwd).resolve()
+        self._gem5_path = Path(gem5_path).resolve()
 
     def cwd(self) -> Path:
         return self._cwd

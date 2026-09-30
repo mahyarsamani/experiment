@@ -1,56 +1,72 @@
 import argparse
+import sys
 
-from ..common.config_util import _get_project_config
+from ..common.log import error, install_warning_format
+
+COMMANDS = {
+    "initialize": "Initialize a project.",
+    "build": "Build gem5.",
+    "run": "Run gem5.",
+    "work": "Run a worker that the scheduler launches jobs on.",
+    "schedule": "Start (or attach to) the scheduler and open its console.",
+    "console": "Attach a console to the running scheduler.",
+    "certs": "Manage certificates for scheduler <-> worker connections.",
+}
+
+
+def _dispatch(command: str, args: list[str]) -> int | None:
+    if command == "initialize":
+        from .initialize import parse_initialize_args, _process_initialize_args
+
+        return _process_initialize_args(*parse_initialize_args(args))
+    if command == "build":
+        from ..common.config_util import _get_project_config
+        from .build import parse_build_args, _process_build_args
+
+        return _process_build_args(
+            _get_project_config(), *parse_build_args(args)
+        )
+    if command == "run":
+        from ..common.config_util import _get_project_config
+        from .run import parse_run_args, _process_run_args
+
+        return _process_run_args(_get_project_config(), *parse_run_args(args))
+    if command == "work":
+        from .work import parse_work_args, _process_work_args
+
+        return _process_work_args(*parse_work_args(args))
+    if command == "schedule":
+        from .schedule import parse_schedule_args, _process_schedule_args
+
+        return _process_schedule_args(*parse_schedule_args(args))
+    if command == "console":
+        from .schedule import parse_console_args, _process_console_args
+
+        return _process_console_args(*parse_console_args(args))
+    if command == "certs":
+        from .certs import parse_certs_args, _process_certs_args
+
+        return _process_certs_args(*parse_certs_args(args))
+    return None
 
 
 def main_function():
-    parser = argparse.ArgumentParser()
-    subparser = parser.add_subparsers(help="sub-command help", dest="command")
-    initialize = subparser.add_parser(
-        "initialize", description="Initialize a project."
-    )
-    build = subparser.add_parser("build", description="Build gem5.")
-    run = subparser.add_parser("run", description="Run gem5.")
-    work = subparser.add_parser(
-        "work", description="Spawn a worker server for rpyc."
-    )
-    schedule = subparser.add_parser(
-        "schedule", description="Spawn a scheduler server for rpyc."
-    )
-
+    install_warning_format()
+    parser = argparse.ArgumentParser(prog="helper", add_help=False)
+    parser.add_argument("command", nargs="?")
     parsed_args, for_subparser = parser.parse_known_args()
-    if parsed_args.command == "initialize":
-        from .initialize import parse_initialize_args, _process_initialize_args
 
-        known_args, unknown_args = parse_initialize_args(for_subparser)
-        _process_initialize_args(known_args, unknown_args)
-    elif parsed_args.command == "build":
-        from .build import parse_build_args, _process_build_args
+    if parsed_args.command in COMMANDS:
+        try:
+            sys.exit(_dispatch(parsed_args.command, for_subparser) or 0)
+        except (FileNotFoundError, FileExistsError, RuntimeError, ValueError) as e:
+            error(e)
+            sys.exit(1)
+        except KeyboardInterrupt:
+            sys.exit(130)
 
-        known_args, unknown_args = parse_build_args(for_subparser)
-        _process_build_args(_get_project_config(), known_args, unknown_args)
-    elif parsed_args.command == "run":
-        from .run import parse_run_args, _process_run_args
-
-        known_args, unknown_args = parse_run_args(for_subparser)
-        _process_run_args(_get_project_config(), known_args, unknown_args)
-    elif parsed_args.command == "work":
-        from .work import parse_work_args, _process_work_args
-
-        known_args, unknown_args = parse_work_args(for_subparser)
-        _process_work_args(known_args, unknown_args)
-    elif parsed_args.command == "schedule":
-        from .schedule import parse_schedule_args, _process_schedule_args
-
-        known_args, unknown_args = parse_schedule_args(for_subparser)
-        _process_schedule_args(known_args, unknown_args)
-    else:
-        error = "To use this script please refer to this usage.\n"
-        error += "\thelper cmd [args]\n"
-        error += "Here are your choices for cmd.\n"
-        for cmd, cmd_parser in subparser._name_parser_map.items():
-            error += f"{cmd}: {cmd_parser.description}\n"
-        error += "You can see the help prompt for each cmd option by using:\n"
-        error += "\thelper cmd"
-        print(error)
-        exit()
+    print("usage: helper <command> [args]\n\ncommands:")
+    for command, description in COMMANDS.items():
+        print(f"  {command:<12} {description}")
+    print("\nRun `helper <command> -h` for help on a command.")
+    sys.exit(0 if parsed_args.command in (None, "-h", "--help") else 2)

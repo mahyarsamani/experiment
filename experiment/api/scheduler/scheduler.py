@@ -1,762 +1,913 @@
-import argparse
+"""The scheduler: places queued jobs on hosts and tracks them to completion.
+
+Threading model: all scheduler state is owned by the thread running
+`Scheduler.run`. Other threads (the console server, the dashboard) never
+touch it directly; they `submit` commands, which run on the scheduler thread
+between ticks, and read an immutable `Snapshot` published after every tick.
+"""
+
 import hashlib
 import importlib.util
+import json
 import logging
-import requests
-import shlex
+import sys
+import threading
 import time
 
-from dataclasses import dataclass
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from enum import Enum
-from flask import (
-    abort,
-    Flask,
-    jsonify,
-    render_template,
-    request,
-    Response,
-    stream_with_context,
-)
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from prompt_toolkit import prompt
-from prompt_toolkit.history import FileHistory
-from queue import Queue
-from threading import RLock, Thread
-from typing import Any, Dict, List, Iterable
-from urllib.parse import quote
-from werkzeug.exceptions import HTTPException
-from werkzeug.serving import make_server
+from queue import Empty, Queue
+from typing import Any, Iterable
+
+from ..host import (
+    SIGNAL,
+    Host,
+    HostUnreachable,
+    JobError,
+    job_status_from_worker,
+)
+from ..work import Experiment, Job, JobStatus
+from .state import StateStore
 
 
-from ..host import healthy, Host
-from ..work import Job, Experiment
+class CommandError(Exception):
+    """A command was refused; the message is meant for the user."""
 
 
-START_DELAY = 2
+class HostMode(Enum):
+    ACTIVE = "active"
+    DRAINING = "draining"
+    REMOVING = "removing"
+
+    def __str__(self) -> str:
+        return self.value
 
 
-def console_print(to_print: Any):
-    print(f"info: {to_print}")
+@dataclass
+class Command:
+    name: str
+    kwargs: dict
+    future: Future = field(default_factory=Future)
 
 
-def console_warn(to_warn: Any):
-    print(f"warn: {to_warn}")
+class EventLog:
+    """Recent notable events, for consoles to show and catch up on."""
+
+    LEVELS = {
+        "info": logging.INFO,
+        "warn": logging.WARNING,
+        "error": logging.ERROR,
+    }
+
+    def __init__(self, logger: logging.Logger, size: int = 1000) -> None:
+        self._logger = logger
+        self._events: deque = deque(maxlen=size)
+        self._seq = 0
+        self._lock = threading.Lock()
+
+    def add(self, level: str, message: str) -> None:
+        with self._lock:
+            self._seq += 1
+            self._events.append((self._seq, time.time(), level, message))
+        self._logger.log(self.LEVELS[level], message)
+
+    def info(self, message: str) -> None:
+        self.add("info", message)
+
+    def warn(self, message: str) -> None:
+        self.add("warn", message)
+
+    def error(self, message: str) -> None:
+        self.add("error", message)
+
+    def since(self, seq: int) -> list[tuple[int, float, str, str]]:
+        with self._lock:
+            return [event for event in self._events if event[0] > seq]
+
+    def last_seq(self) -> int:
+        with self._lock:
+            return self._seq
 
 
-def console_error(to_err: Any):
-    print(f"error: {to_err}")
+@dataclass(frozen=True)
+class Snapshot:
+    taken_at: float
+    info: dict
+    hosts: tuple
+    experiments: tuple
+    jobs: tuple
+    # NOTE: Not serialized; used by the dashboard to proxy file reads.
+    job_locations: dict = field(default_factory=dict)
+    host_objects: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "taken_at": self.taken_at,
+            "info": self.info,
+            "hosts": list(self.hosts),
+            "experiments": list(self.experiments),
+            "jobs": list(self.jobs),
+        }
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _load_objects(script: Path) -> tuple[list[Host], list[Experiment]]:
+    """Run `script` and collect the Hosts and Experiments it defines.
+
+    Looks at the script's top-level variables, and inside dicts, lists,
+    tuples and sets they hold.
+    """
+    mod_name = f"_plugin_{hashlib.sha1(str(script).encode()).hexdigest()}"
+    spec = importlib.util.spec_from_file_location(mod_name, str(script))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load {script}")
+    module = importlib.util.module_from_spec(spec)
+    # NOTE: Let the script import modules that sit next to it.
+    sys.path.insert(0, str(script.parent))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(str(script.parent))
+
+    def walk(obj: Any, seen: set[int]) -> Iterable[Any]:
+        if id(obj) in seen:
+            return
+        seen.add(id(obj))
+        yield obj
+        if isinstance(obj, dict):
+            for value in obj.values():
+                yield from walk(value, seen)
+        elif isinstance(obj, (list, tuple, set, frozenset)):
+            for value in obj:
+                yield from walk(value, seen)
+
+    hosts, experiments, seen = [], [], set()
+    for value in vars(module).values():
+        for obj in walk(value, seen):
+            if isinstance(obj, Host):
+                hosts.append(obj)
+            elif isinstance(obj, Experiment):
+                experiments.append(obj)
+    return hosts, experiments
 
 
 class Scheduler:
-    class JobSignal(Enum):
-        TERM = "term"
-        INT = "int"
-        QUIT = "quit"
-        KILL = "kill"
-        RESET = "reset"
+    SIGNALS = {signal.name.lower(): signal.value for signal in SIGNAL}
 
-        def signal_value(self):
-            return {
-                self.TERM: 15,
-                self.INT: 2,
-                self.QUIT: 3,
-                self.KILL: 9,
-                self.RESET: -1,
-            }[self]
-
-        def verify(self, experiment: Experiment, job: Job, host: Host):
-            if experiment is None or job is None:
-                return False
-            if self.signal_value() != -1 and host is None:
-                return False
-            return True
-
-        def handle(self, job: Job, host: Host) -> str:
-            if self.signal_value() != -1:
-                res = host.kill_job(job, self.signal_value())
-                return (
-                    f"Success sending signal {self.signal_value()} to "
-                    f"{job.id()} ({job.shorthand_command()}) "
-                    f"running on {host.name()}"
-                    if res.ok()
-                    else f"Sending signal {self.signal_value()} to "
-                    f"{job.id()} ({job.shorthand_command()}) on "
-                    f"{host.name()} raised {res.message()}"
-                )
-            else:
-                return (
-                    f"Success clearing {job.id()} ({job.shorthand_command()})"
-                    if job.clear()
-                    else f"Failed to clear job {job.id()} ({job.shorthand_command()})"
-                )
-
-    @dataclass
-    class DashboardSignal:
-        experiment: str
-        job_id: str
-        host: str
-        pid: int
-        signal: str
-
-    def __init__(self, name: str, dashboard_port: int, polling_secs: int):
+    def __init__(
+        self,
+        name: str,
+        polling_secs: float = 1.0,
+        store: StateStore | None = None,
+        logger: logging.Logger | None = None,
+    ) -> None:
         self._name = name
-        self._dashboard_port = dashboard_port
         self._polling_secs = polling_secs
+        self._store = store
+        self._logger = logger or logging.getLogger(f"{name}.scheduler")
+        self._events = EventLog(self._logger)
+        self._info: dict = {"name": name, "started_at": time.time()}
 
-        self._title = f"Scheduler Dashboard {name}:{dashboard_port}"
+        self._hosts: dict[str, Host] = dict()
+        self._host_mode: dict[str, HostMode] = dict()
+        self._experiments: dict[str, Experiment] = dict()
+        self._jobs: dict[str, Job] = dict()
+        self._killing: set[str] = set()
+        self._scripts: dict[str, str] = dict()
+        self._dirty = True
 
-        self._hosts = list()
-        self._hosts_pending_removal = list()
-        self._hosts_lock = RLock()
-
-        self._experiments = list()
-        self._experiments_pending_removal = list()
-        self._experiments_drained = list()
-        self._experiments_lock = RLock()
-
-        self._dashboard_app = Flask(
-            __name__,
-            template_folder="templates",
-            static_folder="static",
-            static_url_path="/static",
+        self._connect_pool = ThreadPoolExecutor(
+            max_workers=8, thread_name_prefix=f"{name}.connect"
         )
-        self._dashboard_server = make_server(
-            "localhost",
-            self._dashboard_port,
-            self._dashboard_app,
-            threaded=True,
-        )
-        self._dashboard_signals = Queue()
-        self._dashboard_messages = Queue()
+        self._connecting: dict[str, Future] = dict()
 
-        self._stop = False
+        self._commands: Queue[Command] = Queue()
+        self._stop = threading.Event()
+        self._stopped = threading.Event()
+        self._snapshot_lock = threading.Lock()
+        self._snapshot = Snapshot(time.time(), dict(self._info), (), (), ())
 
-        self._console = Thread(
-            target=self._run_console, name=f"{self._name}.console"
-        )
-        self._scheduler = Thread(
-            target=self._run_scheduler, name=f"{self._name}.scheduler"
-        )
-        self._dashboard = Thread(
-            target=self._dashboard_server.serve_forever,
-            name=f"{self._name}.dashboard",
-        )
+        self._handlers = {
+            "load": self._cmd_load,
+            "reload": self._cmd_reload,
+            "kill": self._cmd_kill,
+            "drain": self._cmd_drain,
+            "undrain": self._cmd_undrain,
+            "remove": self._cmd_remove,
+            "capacity": self._cmd_capacity,
+            "signal": self._cmd_signal,
+            "reset": self._cmd_reset,
+            "stop": self._cmd_stop,
+        }
 
-        self._setup_api_routes()
+    # ---- Thread-safe interface -------------------------------------------
 
-        self._setup_loggers()
+    def events(self) -> EventLog:
+        return self._events
 
-    def start(self):
-        self._console.start()
-        self._scheduler.start()
-        self._dashboard.start()
+    def set_info(self, **info) -> None:
+        # NOTE: Called before `run` starts, e.g. with the dashboard URL.
+        self._info.update(info)
 
-    def stop(self):
-        self._dashboard_server.shutdown()
-        self._stop = True
+    def snapshot(self) -> Snapshot:
+        with self._snapshot_lock:
+            return self._snapshot
 
-    def _setup_api_routes(self):
-        @self._dashboard_app.get("/")
-        def index():
-            return render_template("base.html", title=self._title)
+    def commands(self) -> list[str]:
+        return list(self._handlers)
 
-        @self._dashboard_app.get("/api/state")
-        def api_state():
-            with self._experiments_lock, self._hosts_lock:
-                return jsonify(
-                    {
-                        "title": self._title,
-                        "hosts": [host.name() for host in self._hosts],
-                        "jobs": [
-                            job.view()
-                            for experiment in self._experiments
-                            for job in experiment.jobs()
-                        ],
-                        "last_update_epoch": time.time(),
-                    }
-                )
-
-        @self._dashboard_app.get("/health")
-        def health():
-            return {"ok": True, "title": self._title}, 200
-
-        @self._dashboard_app.errorhandler(HTTPException)
-        def _http_error(e: HTTPException):
-            return (
-                jsonify({"ok": False, "error": e.description or e.name}),
-                e.code,
+    def submit(self, name: str, **kwargs) -> Future:
+        if name not in self._handlers:
+            raise CommandError(f"unknown command {name!r}")
+        command = Command(name, kwargs)
+        if self._stopped.is_set():
+            command.future.set_exception(
+                CommandError("the scheduler is stopping")
             )
+        else:
+            self._commands.put(command)
+        return command.future
 
-        @self._dashboard_app.errorhandler(Exception)
-        def _unhandled_error(e: Exception):
-            return (
-                jsonify({"ok": False, "error": "internal server error"}),
-                500,
-            )
+    def call(self, name: str, timeout: float = 60, **kwargs) -> list[str]:
+        return self.submit(name, **kwargs).result(timeout=timeout)
 
-        @self._dashboard_app.post("/api/job_action")
-        def api_job_action():
-            data = request.get_json(silent=True) or {}
+    def stop(self) -> None:
+        self._stop.set()
 
-            for k in ("job_id", "pid", "experiment", "host", "signal"):
-                if k not in data:
-                    abort(400, f"missing {k}")
+    def stopping(self) -> bool:
+        return self._stop.is_set()
 
-            if data["signal"] not in {s.value for s in Scheduler.JobSignal}:
-                abort(400, "invalid signal")
+    def wait_stopped(self, timeout: float | None = None) -> bool:
+        return self._stopped.wait(timeout)
 
-            self._dashboard_signals.put(
-                Scheduler.DashboardSignal(
-                    experiment=data["experiment"],
-                    job_id=data["job_id"],
-                    host=data["host"],
-                    pid=data["pid"],
-                    signal=data["signal"],
-                )
-            )
+    def read_job_file(
+        self, job_id: str, label: str, offset: int, length: int
+    ) -> bytes:
+        snapshot = self.snapshot()
+        location = snapshot.job_locations.get(job_id)
+        if location is None:
+            raise CommandError(f"no job {job_id}")
+        outdir, host_name = location
+        host = snapshot.host_objects.get(host_name)
+        if host is None or not host.up():
+            raise HostUnreachable(f"host {host_name} is not connected")
+        return host.read_file(outdir, label, offset, length)
 
-            return jsonify(
-                {
-                    "ok": True,
-                    "received": data,
-                    "server_epoch": time.time(),
-                }
-            )
+    # ---- Scheduler thread ------------------------------------------------
 
-        @self._dashboard_app.get("/files")
-        def proxy_files():
-            host_dom = request.args.get("host", "")
-            raw_path = request.args.get("path", "")
+    def run(self) -> None:
+        try:
+            while not self._stop.is_set():
+                deadline = time.time() + self._polling_secs
+                try:
+                    self._tick()
+                except Exception:
+                    self._logger.exception("Unhandled error in scheduler tick.")
+                self._handle_commands(deadline)
+        finally:
+            self._shutdown()
 
-            if not host_dom or not raw_path:
-                abort(400, "missing host or path")
+    def _handle_commands(self, deadline: float) -> None:
+        """Run commands as they arrive until `deadline`.
 
-            p = Path(raw_path)
-            if not p.is_absolute():
-                abort(400, "path must be absolute")
-
-            # Build the worker URL and stream it back
-            worker_url = f"http://{host_dom}/files?path={quote(str(p))}"
+        Returns early after a command so its effects are scheduled promptly.
+        """
+        while not self._stop.is_set():
+            timeout = deadline - time.time()
+            if timeout <= 0:
+                return
             try:
-                r = requests.get(worker_url, stream=True, timeout=10)
-            except requests.RequestException:
-                abort(502, "upstream worker unreachable")
+                command = self._commands.get(timeout=min(timeout, 0.2))
+            except Empty:
+                continue
+            self._run_command(command)
+            while True:
+                try:
+                    self._run_command(self._commands.get_nowait())
+                except Empty:
+                    break
+            # NOTE: So a view right after a command reflects it.
+            self._publish()
+            return
 
-            # Mirror status & content-type; stream the body
-            headers = {}
-            ct = r.headers.get("Content-Type")
-            if ct:
-                headers["Content-Type"] = ct
-
-            def generate():
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        yield chunk
-
-            return Response(
-                stream_with_context(generate()),
-                status=r.status_code,
-                headers=headers,
+    def _run_command(self, command: Command) -> None:
+        if not command.future.set_running_or_notify_cancel():
+            return
+        try:
+            result = self._handlers[command.name](**command.kwargs)
+        except CommandError as e:
+            command.future.set_exception(e)
+        except Exception as e:
+            self._logger.exception(f"Command {command.name} failed.")
+            command.future.set_exception(
+                CommandError(f"{type(e).__name__}: {e}")
             )
+        else:
+            self._dirty = True
+            command.future.set_result(result)
 
-    def _setup_loggers(self):
-        def _get_logger(
-            name: str, log_file: Path, log_level: int | str
-        ) -> logging.Logger:
-            assert log_file.exists() and log_file.is_file()
-
-            logger = logging.getLogger(name)
-            logger.setLevel(log_level)
-            logger.propagate = False
-            logger.handlers.clear()
-
-            handler = RotatingFileHandler(
-                log_file.as_posix(),
-                maxBytes=10 * 1024 * 1024,  # 10 MiB
-                backupCount=5,
-                encoding="utf-8",
-                delay=True,  # don't open until first emit
+    def _shutdown(self) -> None:
+        self._stopped.set()
+        while True:
+            try:
+                command = self._commands.get_nowait()
+            except Empty:
+                break
+            command.future.set_exception(
+                CommandError("the scheduler is stopping")
             )
-            handler.setLevel(log_level)
-            handler.setFormatter(
-                logging.Formatter(
-                    "%(asctime)s %(levelname)s "
-                    "[%(process)d:%(threadName)s] %(name)s: %(message)s"
-                )
-            )
-            logger.addHandler(handler)
+        try:
+            self._persist(force=True)
+        except Exception:
+            self._logger.exception("Could not save state on shutdown.")
+        for host in self._hosts.values():
+            host.disconnect()
+        self._connect_pool.shutdown(wait=False, cancel_futures=True)
+        self._events.info("Scheduler stopped.")
 
-            return logger
+    def _tick(self) -> None:
+        self._reconnect_hosts()
+        for host in list(self._hosts.values()):
+            if host.up():
+                self._poll_host(host)
+        self._process_killing()
+        self._process_host_removal()
+        self._schedule()
+        self._publish()
+        self._persist()
 
-        dashboard_log_file = Path(f"{self._name}.dashboard.log").resolve()
-        dashboard_log_file.touch()
-        scheduler_log_file = Path(f"{self._name}.scheduler.log").resolve()
-        scheduler_log_file.touch()
+    def _active_jobs(self, host_name: str) -> list[Job]:
+        return [
+            job
+            for job in self._jobs.values()
+            if job.host() == host_name and job.status().active()
+        ]
 
-        self._dashboard_logger = _get_logger(
-            "werkzeug", dashboard_log_file, logging.DEBUG
-        )
+    def _used_capacity(self) -> dict[str, int]:
+        used = {name: 0 for name in self._hosts}
+        for job in self._jobs.values():
+            if job.status().active() and job.host() in used:
+                used[job.host()] += job.demand()
+        return used
 
-        self._scheduler_logger = _get_logger(
-            f"{self._name}.scheduler", scheduler_log_file, logging.DEBUG
-        )
-
-    def _add_experiments(self, new_experiments: List[Experiment]) -> None:
-        with self._experiments_lock:
-            for new_experiment in new_experiments:
-                if new_experiment.name() in [
-                    experiment.name() for experiment in self._experiments
-                ]:
-                    console_warn(
-                        f"{new_experiment.name()} already added! "
-                        "Not adding again."
-                    )
-                elif new_experiment.name() in [
-                    experiment.name()
-                    for experiment in self._experiments_pending_removal
-                ]:
-                    console_warn(
-                        f"{new_experiment.name()} is pending removal. "
-                        "Please wait for it to be "
-                        "removed and then try adding again."
-                    )
-                elif new_experiment.name() in [
-                    experiment.name()
-                    for experiment in self._experiments_drained
-                ]:
-                    console_warn(f"{new_experiment.name()} already drained!")
-                else:
-                    self._experiments.append(new_experiment)
-
-    def _add_hosts(self, new_hosts: List[Host]) -> None:
-        with self._hosts_lock:
-            for new_host in new_hosts:
-                if new_host.name() in [host.name() for host in self._hosts]:
-                    console_warn(
-                        f"{new_host.name()} already added! Won't add again."
-                    )
-                elif new_host.name() in [
-                    host.name() for host in self._hosts_pending_removal
-                ]:
-                    console_warn(
-                        f"new_host.name() is pending removal. "
-                        "Please wait for it to be removed and add again."
-                    )
-                else:
-                    if not (res := new_host.connect()).ok():
-                        console_error(
-                            f"Connecting to {new_host.name()} "
-                            f"raised {res.message()}."
-                        )
-                    else:
-                        self._hosts.append(new_host)
-
-    def _process(self, script_path: str):
-        def _extract_hosts_and_experiments(
-            script_path: Path,
-        ) -> tuple[list[Host], list[Experiment]]:
-            def _load_module_from_path(path: Path):
-                path = path.resolve()
-                if not path.exists():
-                    raise FileNotFoundError(path)
-                if path.suffix != ".py":
-                    raise ValueError(f"Expected a .py file, got: {path}")
-
-                mod_name = (
-                    f"_plugin_{hashlib.sha1(str(path).encode()).hexdigest()}"
-                )
-                spec = importlib.util.spec_from_file_location(
-                    mod_name, str(path)
-                )
-                if spec is None or spec.loader is None:
-                    raise ImportError(f"Could not load spec for {path}")
-
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                return module
-
-            def _walk(obj: Any, *, seen: set[int]) -> Iterable[Any]:
-                oid = id(obj)
-                if oid in seen:
-                    return
-                seen.add(oid)
-
-                yield obj
-
-                if obj is None or isinstance(
-                    obj, (str, bytes, bytearray, int, float, bool, Path)
-                ):
-                    return
-
-                if isinstance(obj, dict):
-                    for v in obj.values():
-                        yield from _walk(v, seen=seen)
-                    return
-
-                if isinstance(obj, (list, tuple, set, frozenset)):
-                    for v in obj:
-                        yield from _walk(v, seen=seen)
-                    return
-
-            def _dedupe_preserve_order(items: list[Any]) -> list[Any]:
-                out: list[Any] = []
-                seen_ids: set[int] = set()
-                for it in items:
-                    if id(it) not in seen_ids:
-                        seen_ids.add(id(it))
-                        out.append(it)
-                return out
-
-            hosts = list()
-            experiments = list()
-            seen = set()
-            for _, top_level_value in vars(
-                _load_module_from_path(script_path)
-            ).items():
-                for x in _walk(top_level_value, seen=seen):
-                    if isinstance(x, Host):
-                        hosts.append(x)
-                    elif isinstance(x, Experiment):
-                        experiments.append(x)
-
-            return _dedupe_preserve_order(hosts), _dedupe_preserve_order(
-                experiments
-            )
-
-        hosts, experiments = _extract_hosts_and_experiments(Path(script_path))
-
-        console_print(f"Found the following in {Path(script_path).resolve()}:")
-        console_print(f"Hosts: {hosts}")
-        console_print(f"Experiments: {experiments}")
-
-        self._add_hosts(hosts)
-        self._add_experiments(experiments)
-
-    def _list_experiments(self) -> Dict[str, List[Experiment]]:
-        with self._experiments_lock:
-            console_print(
-                {
-                    "experiments": [
-                        str(experiment) for experiment in self._experiments
-                    ],
-                    "experiments_pending_removal": [
-                        str(experiment)
-                        for experiment in self._experiments_pending_removal
-                    ],
-                }
-            )
-
-    def _list_hosts(self) -> Dict[str, List[Host]]:
-        with self._hosts_lock:
-            console_print(
-                {
-                    "hosts": [str(host) for host in self._hosts],
-                    "hosts_pending_removal": [
-                        str(host) for host in self._hosts_pending_removal
-                    ],
-                }
-            )
-
-    def _kill_experiment(self, experiment_name: str) -> None:
-        with self._experiments_lock:
-            if experiment_name in [
-                experiment.name()
-                for experiment in self._experiments_pending_removal
-            ]:
-                console_warn(
-                    f"{experiment_name} already pending "
-                    "removal. Won't do anything."
-                )
-            elif experiment_name not in [
-                experiment.name() for experiment in self._experiments
-            ]:
-                console_error(f"{experiment_name} does not exist!")
-            else:
-                to_kill = next(
-                    (
-                        experiment
-                        for experiment in self._experiments
-                        if experiment.name() == experiment_name
-                    )
-                )
-                self._experiments_pending_removal.append(to_kill)
-                self._experiments.remove(to_kill)
-
-    def _kill_host(self, host_name: str) -> None:
-        with self._hosts_lock:
-            if host_name in [
-                host.name() for host in self._hosts_pending_removal
-            ]:
-                console_warn(
-                    f"{host_name} already pending removal. Won't do anything."
-                )
-            elif host_name not in [host.name() for host in self._hosts]:
-                console_error(f"{host_name} does not exist!")
-            else:
-                to_kill = next(
-                    (host for host in self._hosts if host.name() == host_name)
-                )
-                self._hosts_pending_removal.append(to_kill)
-                self._hosts.remove(to_kill)
-
-    def _capacity(self, host_name: str, capacity: int) -> None:
-        with self._hosts_lock:
-            host = next(
-                (host for host in self._hosts if host.name() == host_name),
-                None,
-            )
+    def _reconnect_hosts(self) -> None:
+        for name, future in list(self._connecting.items()):
+            if not future.done():
+                continue
+            del self._connecting[name]
+            host = self._hosts.get(name)
             if host is None:
-                console_error(f"{host_name} does not exist in self._hosts.")
-            else:
-                host.upgrade(capacity)
-
-    def _run_console(self):
-        def build_parser() -> argparse.ArgumentParser:
-            parser = argparse.ArgumentParser(
-                prog="", add_help=True, exit_on_error=False
-            )
-            subparsers = parser.add_subparsers(dest="command", required=True)
-
-            process_parser = subparsers.add_parser(
-                "process",
-                aliases=["p"],
-                exit_on_error=False,
-                help="Process a python script including "
-                "definiton of experiments and/or hosts.",
-            )
-            process_parser.add_argument(
-                "script",
-                type=str,
-                help="Path to python script to process.",
-            )
-
-            list_parser = subparsers.add_parser(
-                "list",
-                aliases=["l"],
-                exit_on_error=False,
-                help="List objects of the specified `kind`.",
-            )
-            list_parser.add_argument("kind", choices=["experiment", "host"])
-
-            kill_parser = subparsers.add_parser(
-                "kill",
-                aliases=["k"],
-                exit_on_error=False,
-                help="Kill object of type `kind` and specified `name`.",
-            )
-            kill_parser.add_argument(
-                "kind",
-                choices=["experiment", "host"],
-            )
-            kill_parser.add_argument(
-                "name", help="Name of the object to kill."
-            )
-
-            capacity_parser = subparsers.add_parser(
-                "capacity",
-                aliases=["c"],
-                exit_on_error=False,
-                help="Modify the capacity of host `name` by `capacity`",
-            )
-            capacity_parser.add_argument(
-                "name", help="Name of the host whose capacity to modify."
-            )
-            capacity_parser.add_argument(
-                "capacity",
-                type=int,
-                help="New capacity of the host. "
-                "Use negative numbers to decrease capacity.",
-            )
-
-            subparsers.add_parser(
-                "stop", exit_on_error=False, help="Stop this scheduler."
-            )
-
-            return parser
-
-        def process_cmd(
-            parser: argparse.ArgumentParser, line: str
-        ) -> argparse.Namespace | None:
-            line = line.strip()
-            if not line:
-                return None  # ignore empty lines
-
-            argv = shlex.split(line)
-            return parser.parse_args(argv)
-
-        def dispatch(args):
-            if args.command in ["process", "p"]:
-                self._process(args.script)
-            if args.command in ["list", "l"]:
-                if args.kind == "experiment":
-                    self._list_experiments()
-                if args.kind == "host":
-                    self._list_hosts()
-            if args.command in ["kill", "k"]:
-                if args.kind == "experiment":
-                    self._kill_experiment(args.name)
-                if args.kind == "host":
-                    self._kill_host(args.name)
-            if args.command in ["capacity", "c"]:
-                self._capacity(args.name, args.capacity)
-            if args.command == "stop":
-                self.stop()
-
-        parser = build_parser()
-        time.sleep(START_DELAY)
-
-        while not self._stop:
-            try:
-                line = prompt(
-                    "> ",
-                    history=FileHistory(f"{self._name}.console_history"),
+                continue
+            if host.up():
+                self._events.info(f"Host {name} connected.")
+                self._dirty = True
+            elif host.failures() == 1 or host.failures() % 10 == 0:
+                self._events.warn(
+                    f"Can't reach host {name} ({host.last_error()}); "
+                    "retrying in the background."
                 )
-                args = process_cmd(parser, line)
-                if args is None:
-                    continue
-                dispatch(args)
-            except SystemExit:
-                # NOTE: argparse still exits on some errors (missing or
-                # extra arguments, -h) even with exit_on_error=False.
-                pass
-            except Exception as e:
-                console_error(e)
+        now = time.time()
+        for name, host in self._hosts.items():
+            if name not in self._connecting and host.due_for_reconnect(now):
+                self._connecting[name] = self._connect_pool.submit(
+                    host.connect
+                )
 
-    def _run_scheduler(self):
-        def _get_candidate(experiments: List[Experiment], capacity: int):
-            candidates = sorted(
-                [
-                    candidate
-                    for candidate in [
-                        experiment.candidate(capacity)
-                        for experiment in experiments
-                    ]
-                    if candidate is not None
-                ],
-                key=lambda j: j.demand(),
+    def _host_lost(self, host: Host, error: Exception) -> None:
+        affected = 0
+        for job in self._active_jobs(host.name()):
+            if job.status() != JobStatus.UNKNOWN:
+                job.set_status(JobStatus.UNKNOWN)
+                affected += 1
+        self._dirty = True
+        self._events.warn(
+            f"Lost host {host.name()} ({error}); {affected} job(s) are now "
+            "unknown and will be checked when it reconnects."
+        )
+
+    def _poll_host(self, host: Host) -> None:
+        jobs = self._active_jobs(host.name())
+        try:
+            results = host.statuses(jobs)
+        except HostUnreachable as e:
+            self._host_lost(host, e)
+            return
+        except JobError as e:
+            self._events.error(f"Polling {host.name()} failed: {e}")
+            return
+        for job, (status, returncode, message) in zip(jobs, results):
+            before = job.status()
+            if status == "missing":
+                if before == JobStatus.UNKNOWN:
+                    # NOTE: The host has no record of this job, so it never
+                    # started (e.g. the scheduler died mid-launch).
+                    job.forget()
+                    self._events.info(
+                        f"Job {job.id()[:8]} never started on {host.name()}; "
+                        "queued it again."
+                    )
+                else:
+                    job.set_status(
+                        JobStatus.FAILED,
+                        message="launch record disappeared "
+                        "(was the outdir deleted?)",
+                    )
+                self._dirty = True
+                continue
+            new = job_status_from_worker(status)
+            if new is None or new == before:
+                continue
+            job.set_status(new, returncode, message)
+            self._dirty = True
+            if new == JobStatus.RUNNING:
+                self._events.info(
+                    f"Job {job.id()[:8]} is running on {host.name()}."
+                )
+            elif new == JobStatus.EXITED:
+                self._events.info(
+                    f"Job {job.id()[:8]} ({job.shorthand_command()}) finished."
+                )
+            elif new == JobStatus.FAILED:
+                self._events.error(
+                    f"Job {job.id()[:8]} ({job.shorthand_command()}) failed "
+                    f"on {host.name()}: returncode={returncode}"
+                    + (f", {message}" if message else "")
+                )
+            elif new == JobStatus.KILLED:
+                self._events.warn(
+                    f"Job {job.id()[:8]} ({job.shorthand_command()}) was killed"
+                    + (f": {message}" if message else ".")
+                )
+
+    def _process_killing(self) -> None:
+        for name in list(self._killing):
+            experiment = self._experiments[name]
+            active = [job for job in experiment.jobs() if job.status().active()]
+            if not active:
+                self._remove_experiment(name)
+                self._events.info(f"Experiment {name} killed and removed.")
+                continue
+            for job in active:
+                host = self._hosts.get(job.host())
+                if host is None or not host.up():
+                    continue
+                try:
+                    host.signal(job, SIGNAL.KILL.value)
+                except HostUnreachable as e:
+                    self._host_lost(host, e)
+                except JobError as e:
+                    self._events.error(
+                        f"Killing job {job.id()[:8]} on {host.name()}: {e}"
+                    )
+
+    def _remove_experiment(self, name: str) -> None:
+        experiment = self._experiments.pop(name)
+        self._killing.discard(name)
+        for job in experiment.jobs():
+            self._jobs.pop(job.id(), None)
+        self._dirty = True
+
+    def _process_host_removal(self) -> None:
+        for name, mode in list(self._host_mode.items()):
+            if mode == HostMode.REMOVING and not self._active_jobs(name):
+                self._drop_host(name)
+                self._events.info(f"Host {name} removed.")
+
+    def _drop_host(self, name: str) -> None:
+        host = self._hosts.pop(name)
+        self._host_mode.pop(name)
+        self._connecting.pop(name, None)
+        host.disconnect()
+        self._dirty = True
+
+    def _schedule(self) -> None:
+        experiments = [
+            experiment
+            for name, experiment in self._experiments.items()
+            if name not in self._killing
+        ]
+        used = self._used_capacity()
+        progress = True
+        while progress:
+            progress = False
+            hosts = sorted(
+                (
+                    host
+                    for name, host in self._hosts.items()
+                    if host.up() and self._host_mode[name] == HostMode.ACTIVE
+                ),
+                key=lambda host: host.max_capacity() - used[host.name()],
                 reverse=True,
             )
-            return candidates[0] if len(candidates) > 0 else None
-
-        while not self._stop:
-            try:
-                with self._experiments_lock, self._hosts_lock:
-                    while not self._dashboard_signals.empty():
-                        req = self._dashboard_signals.get()
-                        experiment = next(
-                            (
-                                experiment
-                                for experiment in self._experiments
-                                if experiment.name() == req.experiment
-                            ),
-                            None,
+            for host in hosts:
+                free = host.max_capacity() - used[host.name()]
+                job = max(
+                    (
+                        candidate
+                        for candidate in (
+                            experiment.candidate(free)
+                            for experiment in experiments
                         )
-                        job = (
-                            next(
-                                (
-                                    job
-                                    for job in experiment.jobs()
-                                    if job.id() == req.job_id
-                                ),
-                                None,
-                            )
-                            if experiment is not None
-                            else None
-                        )
-                        host = next(
-                            (h for h in self._hosts if h.name() == req.host), None
-                        )
-
-                        try:
-                            signal = Scheduler.JobSignal(req.signal)
-                        except ValueError:
-                            signal = None
-                        if signal is None or not signal.verify(
-                            experiment, job, host
-                        ):
-                            message = (
-                                f"Couldn't handle signal for experiment "
-                                f"{req.experiment}, job {req.job_id}, host "
-                                f"{req.host} with pid {req.pid} and signal "
-                                f"{req.signal}. Found experiment: {experiment}, "
-                                f"job: {job}, host: {host}, signal {signal}."
-                            )
-                            self._dashboard_messages.put(message)
-                            self._scheduler_logger.warning(message)
-                            continue
-
-                        message = signal.handle(job, host)
-                        self._dashboard_messages.put(message)
-                        self._scheduler_logger.info(message)
-
-                    # NOTE: Update healthy hosts.
-                    for host in healthy(self._hosts + self._hosts_pending_removal):
-                        host.update()
-
-                    # NOTE: kill experiments.
-                    for experiment in self._experiments_pending_removal:
-                        safe_to_remove = True
-                        for host in healthy(
-                            self._hosts + self._hosts_pending_removal
-                        ):
-                            if not (res := host.kill_experiment(experiment)).ok():
-                                self._scheduler_logger.warning(
-                                    f"Killing {experiment.name()} on "
-                                    f"{host.name()} raised {res.message()}"
-                                )
-                                safe_to_remove &= False
-                            else:
-                                self._scheduler_logger.info(
-                                    f"Killed {experiment.name()} on {host.name()}."
-                                )
-                        experiment.set_safe_to_remove(safe_to_remove)
-
-                    self._experiments_pending_removal = [
-                        experiment
-                        for experiment in self._experiments_pending_removal
-                        if not experiment.safe_to_remove()
-                    ]
-
-                    self._hosts_pending_removal = [
-                        host
-                        for host in healthy(self._hosts_pending_removal)
-                        if not host.idle()
-                    ]
-
-                    found_work = True
-                    while found_work:
-
-                        found_work = False
-                        self._hosts.sort(
-                            key=lambda host: host.capacity(), reverse=True
-                        )
-                        for host in healthy(self._hosts):
-                            job = _get_candidate(
-                                self._experiments, host.capacity()
-                            )
-                            if job is not None:
-                                found_work |= True
-                                if not (res := host.launch_job(job)).ok():
-                                    self._scheduler_logger.warning(
-                                        f"Launching {job} on {host.name()} "
-                                        f"raised {res.message()}"
-                                    )
-                                else:
-                                    self._scheduler_logger.info(
-                                        f"Launched {job} on {host.name()}."
-                                    )
-
-                    self._hosts = [
-                        host for host in self._hosts if not host.failed()
-                    ]
-                    self._hosts_pending_removal = [
-                        host
-                        for host in self._hosts_pending_removal
-                        if not host.failed()
-                    ]
-            except Exception:
-                self._scheduler_logger.exception(
-                    "Unhandled error in scheduler loop."
+                        if candidate is not None
+                    ),
+                    key=lambda job: job.demand(),
+                    default=None,
                 )
-            time.sleep(self._polling_secs)
+                if job is None:
+                    continue
+                progress = True
+                self._launch(host, job)
+                if job.status().active():
+                    used[host.name()] += job.demand()
+                if not host.up():
+                    break
+
+    def _launch(self, host: Host, job: Job) -> None:
+        job.assign(host.name())
+        self._dirty = True
+        # NOTE: Write-ahead: if we die during the launch, the next start
+        # knows to ask this host about the job instead of launching it again.
+        self._persist(force=True)
+        try:
+            host.launch(job)
+        except JobError as e:
+            job.set_status(JobStatus.FAILED, message=f"launch failed: {e}")
+            self._events.error(
+                f"Launching job {job.id()[:8]} on {host.name()} failed: {e}"
+            )
+        except HostUnreachable as e:
+            job.set_status(JobStatus.UNKNOWN)
+            self._host_lost(host, e)
+        else:
+            job.set_status(JobStatus.RUNNING)
+            self._events.info(
+                f"Launched job {job.id()[:8]} ({job.shorthand_command()}) "
+                f"on {host.name()}."
+            )
+
+    def _publish(self) -> None:
+        used = self._used_capacity()
+        hosts = tuple(
+            {
+                "name": name,
+                "domain": host.domain(),
+                "state": str(host.state()),
+                "mode": str(self._host_mode[name]),
+                "capacity": host.max_capacity(),
+                "used": used[name],
+                "jobs": len(self._active_jobs(name)),
+                "error": host.last_error(),
+            }
+            for name, host in self._hosts.items()
+        )
+        experiments = []
+        for name, experiment in self._experiments.items():
+            counts: dict[str, int] = {}
+            for job in experiment.jobs():
+                counts[job.status().value] = (
+                    counts.get(job.status().value, 0) + 1
+                )
+            experiments.append(
+                {
+                    "name": name,
+                    "state": "killing" if name in self._killing else "active",
+                    "outdir": str(experiment.outdir()),
+                    "jobs": len(experiment.jobs()),
+                    "counts": counts,
+                }
+            )
+        snapshot = Snapshot(
+            taken_at=time.time(),
+            info=dict(self._info, scripts=sorted(self._scripts)),
+            hosts=hosts,
+            experiments=tuple(experiments),
+            jobs=tuple(job.view() for job in self._jobs.values()),
+            job_locations={
+                job_id: (job.outdir(), job.host())
+                for job_id, job in self._jobs.items()
+            },
+            host_objects=dict(self._hosts),
+        )
+        with self._snapshot_lock:
+            self._snapshot = snapshot
+
+    # ---- Persistence -----------------------------------------------------
+
+    def _state_data(self) -> dict:
+        return {
+            "name": self._name,
+            "scripts": [
+                {"path": path, "sha256": sha}
+                for path, sha in self._scripts.items()
+            ],
+            "hosts": {
+                name: {
+                    "spec": host.spec(),
+                    "mode": self._host_mode[name].value,
+                }
+                for name, host in self._hosts.items()
+            },
+            "killing": sorted(self._killing),
+            "jobs": {
+                job_id: job.runtime_state()
+                for job_id, job in self._jobs.items()
+                if job.status() != JobStatus.QUEUED
+            },
+        }
+
+    def _persist(self, force: bool = False) -> None:
+        if self._store is None or not (self._dirty or force):
+            return
+        if self._store.save(self._state_data(), force=force):
+            self._dirty = False
+
+    def resume(self, data: dict) -> None:
+        """Rebuild from a saved state. Call before `run`.
+
+        Jobs keep their saved status: only queued jobs are ever launched, so
+        jobs that were running are checked with their host, never restarted.
+        """
+        for script in data.get("scripts", []):
+            path = Path(script["path"])
+            try:
+                if path.exists() and _sha256(path) != script["sha256"]:
+                    self._events.warn(f"{path} changed since it was loaded.")
+                for line in self._load(path, merge=True):
+                    self._logger.info(line)
+            except Exception as e:
+                self._events.error(f"Could not reload {path}: {e}")
+
+        for name, saved in data.get("hosts", {}).items():
+            spec = saved["spec"]
+            if name not in self._hosts:
+                self._add_host(Host.from_spec(spec))
+            self._hosts[name].set_capacity(spec["max_capacity"])
+            self._host_mode[name] = HostMode(saved["mode"])
+
+        for name in data.get("killing", []):
+            if name in self._experiments:
+                self._killing.add(name)
+
+        orphans = []
+        for job_id, saved in data.get("jobs", {}).items():
+            job = self._jobs.get(job_id)
+            if job is None:
+                if JobStatus(saved["status"]).active():
+                    orphans.append((job_id, saved))
+                continue
+            job.restore_runtime_state(saved)
+        for job_id, saved in orphans:
+            self._events.warn(
+                f"Job {job_id[:8]} ({saved['status']} on {saved['host']}, "
+                f"outdir {saved['outdir']}) is no longer defined by any "
+                "script; it is not tracked anymore."
+            )
+        self._dirty = True
+        self._publish()
+        self._events.info(
+            f"Resumed {len(self._experiments)} experiment(s) and "
+            f"{len(self._hosts)} host(s) from saved state."
+        )
+
+    # ---- Commands (run on the scheduler thread) ---------------------------
+
+    def _add_host(self, host: Host) -> None:
+        self._hosts[host.name()] = host
+        self._host_mode[host.name()] = HostMode.ACTIVE
+        self._dirty = True
+
+    def _load(self, script: Path, merge: bool) -> list[str]:
+        script = Path(script).expanduser().resolve()
+        if not script.is_file() or script.suffix != ".py":
+            raise CommandError(f"{script} is not a Python file")
+        hosts, experiments = _load_objects(script)
+        lines = []
+
+        for host in hosts:
+            if host.name() in self._hosts:
+                if not merge:
+                    lines.append(f"host {host.name()} already added; skipped")
+                continue
+            self._add_host(host)
+            lines.append(f"added host {host.name()}")
+
+        for experiment in experiments:
+            name = experiment.name()
+            if name in self._killing:
+                lines.append(f"experiment {name} is being killed; skipped")
+                continue
+            existing = self._experiments.get(name)
+            if existing is not None and not merge:
+                lines.append(
+                    f"experiment {name} already loaded; use `reload` to add "
+                    "new jobs to it"
+                )
+                continue
+            if existing is None:
+                existing = Experiment(name, experiment.outdir())
+                self._experiments[name] = existing
+                lines.append(f"added experiment {name}")
+            added = 0
+            for job in experiment.jobs():
+                owner = self._jobs.get(job.id())
+                if owner is not None:
+                    if owner.experiment() != name:
+                        lines.append(
+                            f"job {job.id()[:8]} in {name} duplicates one in "
+                            f"{owner.experiment()}; skipped"
+                        )
+                    continue
+                existing.register_job(job)
+                self._jobs[job.id()] = job
+                added += 1
+            defined = {job.id() for job in experiment.jobs()}
+            stale = [
+                job for job in existing.jobs() if job.id() not in defined
+            ]
+            lines.append(f"{name}: {added} new job(s)")
+            if merge and stale:
+                lines.append(
+                    f"{name}: {len(stale)} job(s) are no longer in the script "
+                    "(kept)"
+                )
+
+        self._scripts[str(script)] = _sha256(script)
+        self._dirty = True
+        return lines
+
+    def _cmd_load(self, script: str) -> list[str]:
+        if str(Path(script).expanduser().resolve()) in self._scripts:
+            raise CommandError(
+                f"{script} is already loaded; use `reload` to pick up changes"
+            )
+        return self._load(Path(script), merge=False)
+
+    def _cmd_reload(self, script: str) -> list[str]:
+        return self._load(Path(script), merge=True)
+
+    def _experiment(self, name: str) -> Experiment:
+        if name not in self._experiments:
+            raise CommandError(f"no experiment named {name!r}")
+        return self._experiments[name]
+
+    def _host(self, name: str) -> Host:
+        if name not in self._hosts:
+            raise CommandError(f"no host named {name!r}")
+        return self._hosts[name]
+
+    def _resolve_job(self, prefix: str) -> Job:
+        matches = [
+            job for job_id, job in self._jobs.items()
+            if job_id.startswith(prefix)
+        ]
+        if not matches:
+            raise CommandError(f"no job id starts with {prefix!r}")
+        if len(matches) > 1:
+            raise CommandError(
+                f"{prefix!r} matches {len(matches)} jobs; use a longer prefix"
+            )
+        return matches[0]
+
+    def _cmd_kill(self, experiment: str) -> list[str]:
+        self._experiment(experiment)
+        self._killing.add(experiment)
+        return [f"killing experiment {experiment}"]
+
+    def _cmd_drain(self, host: str) -> list[str]:
+        self._host(host)
+        self._host_mode[host] = HostMode.DRAINING
+        return [f"host {host} won't get new jobs"]
+
+    def _cmd_undrain(self, host: str) -> list[str]:
+        self._host(host)
+        self._host_mode[host] = HostMode.ACTIVE
+        return [f"host {host} is accepting jobs again"]
+
+    def _cmd_remove(self, host: str, force: bool = False) -> list[str]:
+        self._host(host)
+        active = self._active_jobs(host)
+        if force:
+            self._drop_host(host)
+            return [
+                f"removed host {host}"
+                + (
+                    f"; {len(active)} job(s) on it are untracked, "
+                    "`reset --force` them to run them elsewhere"
+                    if active
+                    else ""
+                )
+            ]
+        self._host_mode[host] = HostMode.REMOVING
+        return [
+            f"host {host} will be removed once its {len(active)} running "
+            "job(s) finish"
+        ]
+
+    def _cmd_capacity(self, host: str, change: str) -> list[str]:
+        target = self._host(host)
+        try:
+            if change.startswith(("+", "-")):
+                value = target.max_capacity() + int(change)
+            else:
+                value = int(change.lstrip("="))
+        except ValueError:
+            raise CommandError(f"capacity must be +N, -N or =N, not {change!r}")
+        target.set_capacity(value)
+        return [f"host {host} capacity is now {target.max_capacity()}"]
+
+    def _cmd_signal(self, jobs: list[str], signal: str) -> list[str]:
+        if signal not in self.SIGNALS:
+            raise CommandError(
+                f"signal must be one of {', '.join(self.SIGNALS)}"
+            )
+        lines = []
+        for prefix in jobs:
+            job = self._resolve_job(prefix)
+            host = self._hosts.get(job.host() or "")
+            if not job.status().active() or host is None:
+                lines.append(f"{job.id()[:8]}: not running")
+                continue
+            if not host.up():
+                lines.append(f"{job.id()[:8]}: host {host.name()} is down")
+                continue
+            try:
+                sent = host.signal(job, self.SIGNALS[signal])
+            except HostUnreachable as e:
+                self._host_lost(host, e)
+                lines.append(f"{job.id()[:8]}: {e}")
+                continue
+            except JobError as e:
+                lines.append(f"{job.id()[:8]}: {e}")
+                continue
+            lines.append(
+                f"{job.id()[:8]}: sent {signal}"
+                if sent
+                else f"{job.id()[:8]}: was not running"
+            )
+        return lines
+
+    def _cmd_reset(
+        self,
+        jobs: list[str] = (),
+        experiment: str | None = None,
+        status: str | None = None,
+        force: bool = False,
+    ) -> list[str]:
+        targets: list[Job] = [self._resolve_job(prefix) for prefix in jobs]
+        if experiment is not None:
+            wanted = JobStatus(status) if status else None
+            targets += [
+                job
+                for job in self._experiment(experiment).jobs()
+                if (wanted is None and job.status().terminal())
+                or job.status() == wanted
+            ]
+        if not targets:
+            raise CommandError("no jobs to reset")
+        lines, count = [], 0
+        for job in targets:
+            if job.status() == JobStatus.UNKNOWN and force:
+                job.set_status(JobStatus.KILLED)
+            if job.reset():
+                count += 1
+            else:
+                lines.append(
+                    f"{job.id()[:8]} is {job.status()}; "
+                    + (
+                        "use --force to requeue it anyway"
+                        if job.status() == JobStatus.UNKNOWN
+                        else "kill it first"
+                    )
+                )
+        lines.append(f"requeued {count} job(s)")
+        return lines
+
+    def _cmd_stop(self, kill_jobs: bool = False) -> list[str]:
+        lines = []
+        if kill_jobs:
+            killed = 0
+            for job in list(self._jobs.values()):
+                host = self._hosts.get(job.host() or "")
+                if not job.status().active() or host is None or not host.up():
+                    continue
+                try:
+                    killed += host.signal(job, SIGNAL.KILL.value)
+                except (HostUnreachable, JobError) as e:
+                    lines.append(f"{job.id()[:8]}: {e}")
+            lines.append(f"sent SIGKILL to {killed} job(s)")
+        else:
+            running = sum(
+                1 for job in self._jobs.values() if job.status().active()
+            )
+            lines.append(
+                f"{running} job(s) keep running; start the scheduler again "
+                "to pick them back up"
+            )
+        self._stop.set()
+        return lines
