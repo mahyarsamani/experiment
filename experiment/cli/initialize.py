@@ -1,6 +1,7 @@
 import argparse
 
 from ..common.config_util import initialize_directories
+from ..common.log import error
 from ..common.gem5_work import (
     ISA,
     Protocol,
@@ -11,7 +12,7 @@ from ..common.gem5_work import (
 
 def parse_initialize_args(args):
     parser = argparse.ArgumentParser(
-        description="Parse initialize command from helper."
+        prog="helper initialize", description="Initialize a project."
     )
     parser.add_argument("project_name", type=str, help="Name of the project.")
     parser.add_argument(
@@ -47,7 +48,7 @@ def parse_initialize_args(args):
     parser.add_argument(
         "default_protocols",
         type=str,
-        help="Comma separated list of isas to compile by default. "
+        help="Comma separated list of Ruby protocols to compile by default. "
         f"Choose from: {Protocol.return_all_values()}",
     )
     parser.add_argument(
@@ -73,8 +74,10 @@ def parse_initialize_args(args):
     return parser.parse_known_args(args)
 
 
-def _process_initialize_args(initialize_args, unknown_args):
-    assert (unknown_args is None) or (len(unknown_args) == 0)
+def _process_initialize_args(initialize_args, unknown_args) -> int:
+    if unknown_args:
+        error(f"unrecognized arguments: {' '.join(unknown_args)}")
+        return 2
 
     config = gem5ProjectConfiguration(
         initialize_args.project_name,
@@ -90,3 +93,4 @@ def _process_initialize_args(initialize_args, unknown_args):
     )
 
     initialize_directories(config)
+    return 0

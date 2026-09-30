@@ -6,10 +6,10 @@ import shutil
 from git import Repo
 from importlib.resources import files
 from pathlib import Path
-from warnings import warn
 
 from . import assets
 from .cmd_util import run_command
+from .log import warn
 from .gem5_work import (
     gem5BuildConfiguration,
     gem5ProjectConfiguration,
@@ -88,10 +88,10 @@ def initialize_directories(gem5_proj_config: gem5ProjectConfiguration):
         "run_scripts in `scripts` directory. I have found this to be a "
         "good practice. Additionally, I recommend using two decorators "
         "to expose the project directory and record the arguments you pass"
-        "to the run function. I have already added the files needed for "
+        " to the run function. I have already added the files needed for "
         "them under `scripts/util`. Import them like below:\n"
-        "from util.decorators import expose_prject_dir, record_args\n"
-        "I also will put an example in scripts directory that"
+        "from util.decorators import expose_project_dir, record_args\n"
+        "I also will put an example in scripts directory that "
         "uses traffic generators with all the decorators."
     )
 
@@ -165,7 +165,8 @@ def configure_build_directory(
     gem5_source_dir: Path,
     build_dir: Path,
     build_config: gem5BuildConfiguration,
-) -> None:
+) -> int:
+    """Run `scons setconfig` if needed. Returns its exit code (0 if skipped)."""
     old_build_config_path = build_dir / "gem5.build" / "compile_config.json"
 
     need_setconfig = True
@@ -177,14 +178,18 @@ def configure_build_directory(
 
     if not need_setconfig:
         warn("No need to set config as it matches current build config.")
+        return 0
     else:
         warn("Setting config as it does not match current build config.")
         shutil.rmtree(build_dir, ignore_errors=True)
         build_dir.mkdir(parents=True, exist_ok=True)
         setconfig_cmd = build_config.make_setconfig_command(build_dir)
-        run_command(["bash", "-c", setconfig_cmd], gem5_source_dir)
+        returncode = run_command(["bash", "-c", setconfig_cmd], gem5_source_dir)
+        if returncode != 0:
+            # NOTE: Don't record the config, so the next build retries it.
+            return returncode
         with open(old_build_config_path, "w") as config_file:
             json.dump(
                 build_config.dump_config(), config_file, indent=2, default=str
             )
-    return build_dir
+    return 0

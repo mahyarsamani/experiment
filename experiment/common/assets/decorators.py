@@ -1,9 +1,18 @@
 import json
 import re
 import sys
+import warnings
 
 from pathlib import Path
 from warnings import warn
+
+
+def _format_warning(message, category, filename, lineno, line=None) -> str:
+    return f"warning: {message}\n"
+
+
+# NOTE: Print warnings as one short line, without the file and source line.
+warnings.formatwarning = _format_warning
 
 
 def expose_project_dir(run):
@@ -37,7 +46,7 @@ def record_args(run):
             )
 
         with open(outdir / "params.json", "w") as par_ser:
-            json.dump(params, par_ser, indent=2)
+            json.dump(params, par_ser, indent=2, default=str)
         (outdir / "run_function_called").touch()
         run(*args, **kwargs)
         (outdir / "simulation_finished").touch()

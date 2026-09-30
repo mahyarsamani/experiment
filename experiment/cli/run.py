@@ -1,9 +1,9 @@
 import argparse
 
 from pathlib import Path
-from warnings import warn
 
 from ..common.cmd_util import run_command
+from ..common.log import warn
 from ..common.gem5_work import (
     BinaryOpt,
     gem5BuildConfiguration,
@@ -11,7 +11,7 @@ from ..common.gem5_work import (
 
 
 def parse_run_args(args):
-    parser = argparse.ArgumentParser("Parse run command from helper.")
+    parser = argparse.ArgumentParser(prog="helper run", description="Run gem5.")
     parser.add_argument(
         "build_name",
         type=str,
@@ -23,7 +23,7 @@ def parse_run_args(args):
     parser.add_argument(
         "--binary_opt",
         type=str,
-        help="Default binary option to use when compiling.",
+        help="Binary option to run.",
         choices=BinaryOpt.return_all_values(),
         required=False,
     )
@@ -49,7 +49,7 @@ def parse_run_args(args):
     parser.add_argument(
         "--debug-end",
         type=int,
-        help="Debug start tick to pass to gem5.",
+        help="Debug end tick to pass to gem5.",
         required=False,
     )
     parser.add_argument(
@@ -77,15 +77,16 @@ def parse_run_args(args):
     parser.add_argument(
         "--gem5-resource-json",
         type=str,
-        default="/dev/null",
+        default=None,
         required=False,
-        help="Path to the gem5 resource JSON file.",
+        help="Path to a gem5 resource JSON file to append (default: the "
+        "project's, if it has one).",
     )
 
     return parser.parse_known_args(args)
 
 
-def _process_run_args(proj_config, run_args, unknown_args):
+def _process_run_args(proj_config, run_args, unknown_args) -> int:
     def _check_arg_validity(run_args):
         if run_args.gdbinit is not None and not run_args.gdb:
             raise ValueError("gdb-init requires --with-gdb flag.")
@@ -127,9 +128,9 @@ def _process_run_args(proj_config, run_args, unknown_args):
             f"GEM5_RESOURCE_JSON_APPEND={run_args.gem5_resource_json} "
             + command
         )
-    elif path_config.get_gem5_resource_json_path() is not None:
+    elif path_config.gem5_resource_json_path() is not None:
         command = (
-            f"GEM5_RESOURCE_JSON_APPEND={path_config.get_gem5_resource_json_path()} "
+            f"GEM5_RESOURCE_JSON_APPEND={path_config.gem5_resource_json_path()} "
             + command
         )
     else:
@@ -157,4 +158,4 @@ def _process_run_args(proj_config, run_args, unknown_args):
     for unknown_arg in unknown_args:
         command += f" {unknown_arg}"
 
-    run_command(["bash", "-c", command], path_config.project_dir())
+    return run_command(["bash", "-c", command], path_config.project_dir())

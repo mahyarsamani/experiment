@@ -2,6 +2,7 @@ import argparse
 
 from ..common.cmd_util import run_command
 from ..common.config_util import configure_build_directory
+from ..common.log import error
 from ..common.gem5_work import (
     BinaryOpt,
     gem5BuildConfiguration,
@@ -11,7 +12,9 @@ from ..common.gem5_work import (
 
 
 def parse_build_args(args):
-    parser = argparse.ArgumentParser("Parse build command from helper.")
+    parser = argparse.ArgumentParser(
+        prog="helper build", description="Build gem5."
+    )
     parser.add_argument(
         "build_name",
         type=str,
@@ -20,21 +23,21 @@ def parse_build_args(args):
     parser.add_argument(
         "--isas",
         type=str,
-        help="Comma separated list of compiled to run."
+        help="Comma separated list of ISAs to compile. "
         f"Choose from: {ISA.return_all_values()}",
         required=False,
     )
     parser.add_argument(
         "--protocols",
         type=str,
-        help="Comma separated list of isas to compile by default."
+        help="Comma separated list of Ruby protocols to compile. "
         f"Choose from: {Protocol.return_all_values()}",
         required=False,
     )
     parser.add_argument(
         "--binary_opt",
         type=str,
-        help="Default binary option to use when compiling.",
+        help="Binary option to compile.",
         choices=BinaryOpt.return_all_values(),
         required=False,
     )
@@ -76,8 +79,10 @@ def parse_build_args(args):
     return parser.parse_known_args(args)
 
 
-def _process_build_args(proj_config, build_args, unknown_args):
-    assert (unknown_args is None) or (len(unknown_args) == 0)
+def _process_build_args(proj_config, build_args, unknown_args) -> int:
+    if unknown_args:
+        error(f"unrecognized arguments: {' '.join(unknown_args)}")
+        return 2
 
     build_dir = (
         proj_config.path_config().gem5_binary_base_dir()
@@ -89,9 +94,12 @@ def _process_build_args(proj_config, build_args, unknown_args):
         proj_config.build_config(),
     )
 
-    configure_build_directory(
+    returncode = configure_build_directory(
         proj_config.path_config().gem5_source_dir(), build_dir, build_config
     )
+    if returncode != 0:
+        error(f"scons setconfig failed with exit code {returncode}.")
+        return returncode
 
     command = (
         f"scons -C {proj_config.path_config().gem5_source_dir()} "
@@ -112,4 +120,4 @@ def _process_build_args(proj_config, build_args, unknown_args):
     if build_args.threads:
         command += f" -j {build_args.threads}"
 
-    run_command(["bash", "-c", command], build_dir)
+    return run_command(["bash", "-c", command], build_dir)

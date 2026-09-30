@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "experiment"
+version = "0.27.0"
+description = "Experimentation tooling for gem5"
+license = { text = "MIT" }
+authors = [{ name = "Mahyar Samani", email = "msamani@ucdavis.edu" }]
+requires-python = ">=3.12"
+dependencies = [
+    "cryptography",
+    "flask",
+    "gitpython",
+    "prompt_toolkit",
+    "psutil",
+    "rpyc>=6",
+    "werkzeug",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/mahyarsamani/experiment"
+
+[project.scripts]
+helper = "experiment.cli.helper:main_function"
+
+[tool.setuptools.packages.find]
+include = ["experiment*"]
+
+[tool.setuptools.package-data]
+"experiment.common" = ["assets/*.py"]
+"experiment.api.scheduler" = ["templates/*.html", "static/*.css"]
