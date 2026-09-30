@@ -277,14 +277,18 @@ class Scheduler:
         """Run commands as they arrive until `deadline`.
 
         Returns early after a command so its effects are scheduled promptly.
+        Pending commands always run, even if the tick used up the interval.
         """
         while not self._stop.is_set():
             timeout = deadline - time.time()
-            if timeout <= 0:
-                return
             try:
-                command = self._commands.get(timeout=min(timeout, 0.2))
+                if timeout <= 0:
+                    command = self._commands.get_nowait()
+                else:
+                    command = self._commands.get(timeout=min(timeout, 0.2))
             except Empty:
+                if timeout <= 0:
+                    return
                 continue
             self._run_command(command)
             while True:
