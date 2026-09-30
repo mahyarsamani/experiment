@@ -62,6 +62,12 @@
       toastTimer = setTimeout(() => toastEl.classList.add("hidden"), ms);
     }
 
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, (c) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+      })[c]);
+    }
+
     function fmtTime(epoch) {
       return new Date(epoch * 1000).toLocaleString();
     }
@@ -121,22 +127,22 @@
         const resDisabledAttr = resetable ? "" : "disabled";
 
         return `
-          <div class="row" data-job-id="${jobId}">
-            <div class="kbd" style="margin-bottom:6px;">${j.experiment}</div>
+          <div class="row" data-job-id="${esc(jobId)}">
+            <div class="kbd" style="margin-bottom:6px;">${esc(j.experiment)}</div>
 
             <div>
-              <div class="kbd">${j.command}</div>
+              <div class="kbd">${esc(j.command)}</div>
               <div class="links">
                 ${(j.links || []).map(l =>
-                  `<a href="${l.href}" target="_blank" rel="noopener">${l.label}</a>`
+                  `<a href="${esc(l.href)}" target="_blank" rel="noopener">${esc(l.label)}</a>`
                 ).join('')}
               </div>
             </div>
 
-            <div><span class="pill">${j.host}</span></div>
+            <div><span class="pill">${esc(j.host)}</span></div>
 
             <div class="status">
-              <span class="dot" style="background:${j.status_color}"></span>${j.status}
+              <span class="dot" style="background:${esc(j.status_color)}"></span>${esc(j.status)}
             </div>
 
             <div class="actions">
@@ -197,7 +203,7 @@
       if (!meta.running && signal !== 'reset') return;
 
       // Extra confirmation for SIGKILL
-      if (signal === "KILL") {
+      if (signal === "kill") {
         const ok = confirm(
           `Send SIGKILL to ${experiment} @ ${host}\n(job ${job_id}, pid ${pid})?\nThis is immediate.`
         );

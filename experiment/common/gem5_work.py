@@ -1,3 +1,4 @@
+import json
 import platform
 
 from argparse import Namespace
@@ -18,7 +19,9 @@ def _is_valid(args, attr):
 
 
 def calculate_hash(items: List) -> str:
-    str_form = "".join(map(str, items))
+    # NOTE: json keeps item boundaries, so ("a", "bc") and ("ab", "c")
+    # hash differently.
+    str_form = json.dumps(items, default=str)
     return sha256(str_form.encode()).hexdigest()
 
 
@@ -250,11 +253,12 @@ job = gem5FSSimulation(
         *args,
         **kwargs,
     ):
-        items = (
-            [run_script_path]
-            + list(args)
-            + [item for pair in kwargs.items() for item in pair]
-        )
+        items = [
+            experiment.gem5_path(),
+            run_script_path,
+            list(args),
+            sorted(kwargs.items()),
+        ]
         id = calculate_hash(items)
         outdir = experiment.outdir() / id
         command = gem5FSSimulation.make_command(

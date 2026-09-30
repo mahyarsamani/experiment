@@ -76,9 +76,13 @@ class Scheduler:
             if self.signal_value() != -1:
                 res = host.kill_job(job, self.signal_value())
                 return (
-                    f"Success sending signal {self.signal_value()} to {job.id()} ({job.shorthand_command()}) running on {host.name()}"
+                    f"Success sending signal {self.signal_value()} to "
+                    f"{job.id()} ({job.shorthand_command()}) "
+                    f"running on {host.name()}"
                     if res.ok()
-                    else f"Sending signal {self.signal_value()} to {job.id()} ({job.shorthand_command()}) on {host.name()} raised {res.message()}"
+                    else f"Sending signal {self.signal_value()} to "
+                    f"{job.id()} ({job.shorthand_command()}) on "
+                    f"{host.name()} raised {res.message()}"
                 )
             else:
                 return (
@@ -195,19 +199,11 @@ class Scheduler:
         def api_job_action():
             data = request.get_json(silent=True) or {}
 
-            action = data.get("action")
-
-            for k in ("job_id", "pid", "experiment", "host"):
+            for k in ("job_id", "pid", "experiment", "host", "signal"):
                 if k not in data:
                     abort(400, f"missing {k}")
 
-            if action == "signal" and data.get("signal") not in {
-                "TERM",
-                "INT",
-                "QUIT",
-                "KILL",
-                "RESET",
-            }:
+            if data["signal"] not in {s.value for s in Scheduler.JobSignal}:
                 abort(400, "invalid signal")
 
             self._dashboard_signals.put(
@@ -620,12 +616,12 @@ class Scheduler:
                 if args is None:
                     continue
                 dispatch(args)
-            except argparse.ArgumentError as e:
-                console_print(e)
             except SystemExit:
+                # NOTE: argparse still exits on some errors (missing or
+                # extra arguments, -h) even with exit_on_error=False.
                 pass
             except Exception as e:
-                console_print(e)
+                console_error(e)
 
     def _run_scheduler(self):
         def _get_candidate(experiments: List[Experiment], capacity: int):
@@ -644,108 +640,123 @@ class Scheduler:
             return candidates[0] if len(candidates) > 0 else None
 
         while not self._stop:
-            with self._experiments_lock, self._hosts_lock:
-                while not self._dashboard_signals.empty():
-                    req = self._dashboard_signals.get()
-                    experiment = next(
-                        (
-                            experiment
-                            for experiment in self._experiments
-                            if experiment.name() == req.experiment
-                        ),
-                        None,
-                    )
-                    job = next(
-                        (
-                            job
-                            for job in experiment.jobs()
-                            if job.id() == req.job_id
-                        ),
-                        None,
-                    )
-                    host = next(
-                        (h for h in self._hosts if h.name() == req.host), None
-                    )
-
-                    signal = Scheduler.JobSignal(req.signal)
-                    if signal is None or not signal.verify(
-                        experiment, job, host
-                    ):
-                        message = (
-                            f"Couldn't handle signal for experiment {req.experiment}, job {req.job_id}, host {req.host} with pid {req.pid} and signal {req.signal}.\n"
-                            f"Found experiment: {experiment}, job: {job}, host: {host}, signal {signal}."
+            try:
+                with self._experiments_lock, self._hosts_lock:
+                    while not self._dashboard_signals.empty():
+                        req = self._dashboard_signals.get()
+                        experiment = next(
+                            (
+                                experiment
+                                for experiment in self._experiments
+                                if experiment.name() == req.experiment
+                            ),
+                            None,
                         )
+                        job = (
+                            next(
+                                (
+                                    job
+                                    for job in experiment.jobs()
+                                    if job.id() == req.job_id
+                                ),
+                                None,
+                            )
+                            if experiment is not None
+                            else None
+                        )
+                        host = next(
+                            (h for h in self._hosts if h.name() == req.host), None
+                        )
+
+                        try:
+                            signal = Scheduler.JobSignal(req.signal)
+                        except ValueError:
+                            signal = None
+                        if signal is None or not signal.verify(
+                            experiment, job, host
+                        ):
+                            message = (
+                                f"Couldn't handle signal for experiment "
+                                f"{req.experiment}, job {req.job_id}, host "
+                                f"{req.host} with pid {req.pid} and signal "
+                                f"{req.signal}. Found experiment: {experiment}, "
+                                f"job: {job}, host: {host}, signal {signal}."
+                            )
+                            self._dashboard_messages.put(message)
+                            self._scheduler_logger.warning(message)
+                            continue
+
+                        message = signal.handle(job, host)
                         self._dashboard_messages.put(message)
-                        self._scheduler_logger.warning(message)
-                        continue
+                        self._scheduler_logger.info(message)
 
-                    message = signal.handle(job, host)
-                    self._dashboard_messages.put(message)
-                    self._scheduler_logger.info(message)
+                    # NOTE: Update healthy hosts.
+                    for host in healthy(self._hosts + self._hosts_pending_removal):
+                        host.update()
 
-                # NOTE: Update healthy hosts.
-                for host in healthy(self._hosts + self._hosts_pending_removal):
-                    host.update()
-
-                # NOTE: kill experiments.
-                for experiment in self._experiments_pending_removal:
-                    safe_to_remove = True
-                    for host in healthy(
-                        self._hosts + self._hosts_pending_removal
-                    ):
-                        if not (res := host.kill_experiment(experiment)).ok():
-                            self._scheduler_logger.warning(
-                                f"Killing {experiment.name()} on "
-                                f"{host.name()} raised {res.message()}"
-                            )
-                            safe_to_remove &= False
-                        else:
-                            self._scheduler_logger.info(
-                                f"Killed {experiment.name()} on {host.name()}."
-                            )
-                    experiment.set_safe_to_remove(safe_to_remove)
-
-                self._experiments_pending_removal = [
-                    experiment
-                    for experiment in self._experiments_pending_removal
-                    if not experiment.safe_to_remove()
-                ]
-
-                self._hosts_pending_removal = [
-                    host
-                    for host in healthy(self._hosts_pending_removal)
-                    if not host.idle()
-                ]
-
-                found_work = True
-                while found_work:
-
-                    found_work = False
-                    self._hosts.sort(
-                        key=lambda host: host.capacity(), reverse=True
-                    )
-                    for host in healthy(self._hosts):
-                        job = _get_candidate(
-                            self._experiments, host.capacity()
-                        )
-                        if job is not None:
-                            found_work |= True
-                            if not (res := host.launch_job(job)).ok():
+                    # NOTE: kill experiments.
+                    for experiment in self._experiments_pending_removal:
+                        safe_to_remove = True
+                        for host in healthy(
+                            self._hosts + self._hosts_pending_removal
+                        ):
+                            if not (res := host.kill_experiment(experiment)).ok():
                                 self._scheduler_logger.warning(
-                                    f"Launching {job} on {host.name()} "
-                                    f"raised {res.message()}"
+                                    f"Killing {experiment.name()} on "
+                                    f"{host.name()} raised {res.message()}"
                                 )
+                                safe_to_remove &= False
                             else:
                                 self._scheduler_logger.info(
-                                    f"Launched {job} on {host.name()}."
+                                    f"Killed {experiment.name()} on {host.name()}."
                                 )
+                        experiment.set_safe_to_remove(safe_to_remove)
 
-                self._hosts = [
-                    host for host in self._hosts if not host.failed()
-                ]
-                self._hosts_pending_removal = [
-                    host
-                    for host in self._hosts_pending_removal
-                    if not host.failed()
-                ]
+                    self._experiments_pending_removal = [
+                        experiment
+                        for experiment in self._experiments_pending_removal
+                        if not experiment.safe_to_remove()
+                    ]
+
+                    self._hosts_pending_removal = [
+                        host
+                        for host in healthy(self._hosts_pending_removal)
+                        if not host.idle()
+                    ]
+
+                    found_work = True
+                    while found_work:
+
+                        found_work = False
+                        self._hosts.sort(
+                            key=lambda host: host.capacity(), reverse=True
+                        )
+                        for host in healthy(self._hosts):
+                            job = _get_candidate(
+                                self._experiments, host.capacity()
+                            )
+                            if job is not None:
+                                found_work |= True
+                                if not (res := host.launch_job(job)).ok():
+                                    self._scheduler_logger.warning(
+                                        f"Launching {job} on {host.name()} "
+                                        f"raised {res.message()}"
+                                    )
+                                else:
+                                    self._scheduler_logger.info(
+                                        f"Launched {job} on {host.name()}."
+                                    )
+
+                    self._hosts = [
+                        host for host in self._hosts if not host.failed()
+                    ]
+                    self._hosts_pending_removal = [
+                        host
+                        for host in self._hosts_pending_removal
+                        if not host.failed()
+                    ]
+            except Exception:
+                self._scheduler_logger.exception(
+                    "Unhandled error in scheduler loop."
+                )
             time.sleep(self._polling_secs)

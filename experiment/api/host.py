@@ -50,6 +50,10 @@ class Failure(Result):
         )
 
 
+class JobError(Exception):
+    """An operation on a single job failed; the host itself is fine."""
+
+
 class Human:
     def __init__(self) -> None:
         self._failed = False
@@ -111,6 +115,8 @@ class Host(Human):
         try:
             ret = func(*args, **kwargs)
             return Success(ret)
+        except JobError as e:
+            return Failure(f"{self._name}::{func.__name__}", e)
         except Exception as e:
             self._fail()
             return Failure(f"{self._name}::{func.__name__}", e)
@@ -137,18 +143,20 @@ class Host(Human):
     def _launch_job(self, job: Job) -> int:
         if self._connection is None:
             raise RuntimeError(f"Connection not established for {self}.")
-        job.set_pid(
-            self._connection.root.launch_job(
-                job.cwd().as_posix(),
-                job.command(),
-                job.outdir().as_posix(),
-                [path.as_posix() for _, path in job.aux_file_io()],
-                [
-                    (content, path.as_posix())
-                    for _, content, path in job.optional_dump()
-                ],
-            )
+        pid = self._connection.root.launch_job(
+            job.cwd().as_posix(),
+            job.command(),
+            job.outdir().as_posix(),
+            [path.as_posix() for _, path in job.aux_file_io()],
+            [
+                (content, path.as_posix())
+                for _, content, path in job.optional_dump()
+            ],
         )
+        if pid == -1:
+            job.set_status(JobStatus.FAILED)
+            raise JobError(f"{self._name} failed to launch {job}.")
+        job.set_pid(pid)
         job.set_links(
             self._name,
             [
@@ -178,14 +186,14 @@ class Host(Human):
             self._running_jobs[job.experiment()].remove(job)
             return True
         else:
-            raise RuntimeError(f"{self._name} failed to kill {job}.")
+            raise JobError(f"{self._name} failed to kill {job}.")
 
     def kill_job(self, job: Job, signal: int) -> Result:
         return self._fail_gracefully(self._kill_job, job, signal)
 
     def _update(self) -> bool:
         for experiment, jobs in self._running_jobs.items():
-            for job in jobs:
+            for job in list(jobs):
                 job.set_status(self._connection.root.job_status(job.pid()))
                 if not job.running():
                     self._finished_jobs[experiment].append(job)
@@ -197,9 +205,9 @@ class Host(Human):
 
     def _kill_experiment(self, experiment: Experiment) -> Result:
         if experiment.name() not in self._running_jobs:
-            True
+            return True
 
-        for job in self._running_jobs[experiment.name()]:
+        for job in list(self._running_jobs[experiment.name()]):
             self._kill_job(job, 9)
 
         return True
