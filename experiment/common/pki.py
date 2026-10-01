@@ -7,6 +7,7 @@ certificate's OU so a worker only accepts schedulers, not other workers.
 
 import datetime
 import ipaddress
+import logging
 import os
 import ssl
 
@@ -19,6 +20,8 @@ from .log import warn
 WORKER = "worker"
 SCHEDULER = "scheduler"
 ROLES = (WORKER, SCHEDULER)
+
+_logger = logging.getLogger("worker.auth")
 
 CA_NAME = "ca"
 
@@ -231,12 +234,22 @@ class RoleAuthenticator:
 
     def __call__(self, sock):
         try:
+            peer = sock.getpeername()
+        except OSError:
+            peer = "?"
+        try:
             sock2 = self._context.wrap_socket(sock, server_side=True)
         except (ssl.SSLError, OSError) as e:
+            _logger.warning(f"TLS handshake with {peer} failed: {e}")
             raise AuthenticationError(str(e))
         peercert = sock2.getpeercert()
-        if peer_role(peercert) != self._role:
+        role = peer_role(peercert)
+        if role != self._role:
             sock2.close()
+            _logger.warning(
+                f"Rejected {peer}: certificate role is {role!r}, "
+                f"not {self._role!r}"
+            )
             raise AuthenticationError(
                 f"peer certificate role is not {self._role!r}"
             )

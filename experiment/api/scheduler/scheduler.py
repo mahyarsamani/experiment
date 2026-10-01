@@ -186,6 +186,7 @@ class Scheduler:
             max_workers=8, thread_name_prefix=f"{name}.connect"
         )
         self._connecting: dict[str, Future] = dict()
+        self._reported_errors: dict[str, str | None] = dict()
 
         self._commands: Queue[Command] = Queue()
         self._stop = threading.Event()
@@ -370,8 +371,15 @@ class Scheduler:
                 continue
             if host.up():
                 self._events.info(f"Host {name} connected.")
+                self._reported_errors.pop(name, None)
                 self._dirty = True
-            elif host.failures() == 1 or host.failures() % 10 == 0:
+            elif (
+                self._reported_errors.get(name) != host.last_error()
+                or host.failures() % 10 == 0
+            ):
+                # NOTE: Report each new kind of error, and repeats only now
+                # and then.
+                self._reported_errors[name] = host.last_error()
                 self._events.warn(
                     f"Can't reach host {name} ({host.last_error()}); "
                     "retrying in the background."

@@ -59,18 +59,27 @@ def _process_certs_args(known_args, unknown_args) -> int:
             name = known_args.name
             sans = list(known_args.san)
             if name is None:
-                if known_args.role == pki.WORKER:
-                    name = platform.node()
-                    fqdn = socket.getfqdn()
-                    if fqdn not in (name, *sans):
-                        sans.append(fqdn)
-                else:
-                    name = pki.SCHEDULER
+                name = (
+                    platform.node()
+                    if known_args.role == pki.WORKER
+                    else pki.SCHEDULER
+                )
+            if known_args.role == pki.WORKER and name == platform.node():
+                # NOTE: Issuing for this machine: also cover its full name,
+                # which is what Hosts usually use as `domain`.
+                fqdn = socket.getfqdn()
+                if fqdn not in (name, *sans):
+                    sans.append(fqdn)
             cert, key = pki.issue(
                 known_args.role, name, sans, directory, known_args.days
             )
             info(f"Issued {cert} and {key}.")
             if known_args.role == pki.WORKER:
+                names = ", ".join(dict.fromkeys([name, *sans]))
+                info(
+                    f"Valid for: {names}. A Host's `domain` must be one of "
+                    "these; add others with --san."
+                )
                 info(f"Run the worker with: helper work --name {name}")
         else:
             for path in sorted(directory.glob("*.crt")):
