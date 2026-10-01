@@ -1,4 +1,5 @@
 import argparse
+import errno
 import logging
 import platform
 import socket
@@ -81,14 +82,26 @@ def _process_work_args(known_args, unknown_args) -> int:
             return 1
         authenticator = pki.RoleAuthenticator(cert, key, ca, pki.SCHEDULER)
 
-    server = ThreadedServer(
-        Worker(),
-        hostname=bind,
-        port=known_args.port,
-        authenticator=authenticator,
-        protocol_config=PROTOCOL_CONFIG,
-        logger=logging.getLogger("worker"),
-    )
+    try:
+        server = ThreadedServer(
+            Worker(),
+            hostname=bind,
+            port=known_args.port,
+            authenticator=authenticator,
+            protocol_config=PROTOCOL_CONFIG,
+            logger=logging.getLogger("worker"),
+        )
+    except OSError as e:
+        if e.errno == errno.EADDRINUSE:
+            error(
+                f"Port {known_args.port} is already in use, probably by "
+                "another (or an old) worker. Find it with: "
+                f"ss -ltnp | grep :{known_args.port}  — or pick another "
+                "port with --port (and pass the same port to Host)."
+            )
+        else:
+            error(f"Could not listen on {bind}:{known_args.port}: {e}")
+        return 1
     info(
         f"Worker listening on {bind}:{known_args.port}"
         + ("" if authenticator is None else " (mutual TLS)")
