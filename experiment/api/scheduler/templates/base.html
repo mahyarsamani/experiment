@@ -6,18 +6,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{{ title }}</title>
   <link rel="stylesheet" href="/static/style.css" />
-  <style>
-    .table-head > div[data-sort-by] {
-      cursor: pointer;
-      user-select: none;
-    }
-    .sort-asc::after {
-      content: ' ▲';
-    }
-    .sort-desc::after {
-      content: ' ▼';
-    }
-  </style>
 </head>
 <body>
   <header>
@@ -26,38 +14,106 @@
   </header>
 
   <div class="wrap">
-    <div class="card">
-      <div class="table-head row" id="table-head">
-        <div data-sort-by="experiment">Experiment</div>
-        <div>Job Command / Links</div>
-        <div data-sort-by="host">Host</div>
-        <div data-sort-by="status">Status</div>
-        <div>Action</div>
-      </div>
-      <div id="jobs"></div>
+    <div class="small hosts">Hosts: <span id="hosts">—</span></div>
+
+    <div class="card filters">
+      <label>Experiment
+        <select id="f-experiment"><option value="">all</option></select>
+      </label>
+      <label>Host
+        <select id="f-host"><option value="">all</option></select>
+      </label>
+      <label>Started from
+        <input id="f-since" type="datetime-local" />
+      </label>
+      <label>to
+        <input id="f-until" type="datetime-local" />
+      </label>
+      <label class="grow">Search
+        <input id="f-text" type="search" placeholder="id or command" />
+      </label>
+      <button id="f-clear" type="button">Clear filters</button>
+      <div class="statuses" id="f-statuses"></div>
     </div>
 
-    <div class="small" style="margin-top:8px;">Hosts: <span id="hosts"></span></div>
+    <div class="card bulk">
+      <span id="sel-count">0 selected</span>
+      <button type="button" id="sel-matching">Select all matching</button>
+      <button type="button" id="sel-clear">Clear selection</button>
+      <span class="spacer"></span>
+      <button type="button" class="bulk-btn danger" data-action="kill" disabled>Kill</button>
+      <button type="button" class="bulk-btn" data-action="term" disabled>TERM</button>
+      <button type="button" class="bulk-btn" data-action="int" disabled>INT</button>
+      <button type="button" class="bulk-btn" data-action="quit" disabled>QUIT</button>
+      <button type="button" class="bulk-btn" data-action="reset" disabled>Reset</button>
+      <button type="button" class="bulk-btn danger" data-action="delete" disabled>Delete</button>
+      <span class="spacer"></span>
+      <button type="button" id="collapse-all">Collapse all</button>
+      <button type="button" id="expand-all">Expand all</button>
+    </div>
+
+    <div class="card">
+      <table class="jobs">
+        <thead>
+          <tr id="table-head">
+            <th class="check"></th>
+            <th data-sort-by="id">ID</th>
+            <th data-sort-by="status">Status</th>
+            <th data-sort-by="host">Host</th>
+            <th data-sort-by="start_time">Started</th>
+            <th data-sort-by="end_time">Ended</th>
+            <th data-sort-by="command">Command / files</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="jobs"></tbody>
+      </table>
+      <div id="empty" class="small hidden">No jobs match the filters.</div>
+    </div>
+
+    <div class="card">
+      <div class="small section">Loaded scripts</div>
+      <div id="scripts"></div>
+      <div class="small" id="deleted"></div>
+    </div>
   </div>
 
-  <!-- Toast bubble -->
   <div id="toast" class="toast hidden"></div>
 
+  <script id="initial-state" type="application/json">{{ state|tojson }}</script>
   <script>
-    const jobsEl = document.getElementById('jobs');
-    const luEl = document.getElementById('lu');
-    const tableHeadEl = document.getElementById('table-head');
-    const hostsEl = document.getElementById('hosts');
-    const toastEl = document.getElementById('toast');
+    const STATUSES = ["queued", "launching", "running", "unknown", "exited", "failed", "killed"];
+    const ACTIVE = ["launching", "running", "unknown"];
+    const FINISHED = ["exited", "failed", "killed"];
+
+    const $ = (id) => document.getElementById(id);
+    const jobsEl = $("jobs");
+    const toastEl = $("toast");
+
+    // NOTE: Browser storage may be unavailable (private windows, blocked
+    // site data); the page works without it.
+    function load(key, fallback) {
+      try {
+        const value = localStorage.getItem(key);
+        return value === null ? fallback : JSON.parse(value);
+      } catch (_) { return fallback; }
+    }
+    function save(key, value) {
+      try { localStorage.setItem(key, JSON.stringify(value)); } catch (_) {}
+    }
+
+    const collapsed = new Set(load("collapsed", []));
+    const selected = new Set();
+    let filters = load("filters", { experiment: "", host: "", since: "", until: "", text: "", statuses: [] });
+    let sortState = load("sort", { key: "id", asc: true });
+    let lastState = null;
+    let visibleIds = [];
 
     let toastTimer = null;
-
     function showToast(msg, kind = "error", ms = 3500) {
-      if (!toastEl) return;
       toastEl.textContent = msg;
       toastEl.classList.remove("hidden", "error", "ok");
       toastEl.classList.add(kind);
-
       clearTimeout(toastTimer);
       toastTimer = setTimeout(() => toastEl.classList.add("hidden"), ms);
     }
@@ -69,200 +125,326 @@
     }
 
     function fmtTime(epoch) {
-      return new Date(epoch * 1000).toLocaleString();
+      if (epoch === null || epoch === undefined) return "";
+      const d = new Date(epoch * 1000);
+      const pad = (n) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
     }
 
-    function isRunningJob(j) {
-      return ["running", "launching", "unknown"].includes(j.status || "");
-    }
-
-    function canReset(j) {
-      return ["exited", "failed", "killed"].includes(j.status || "");
+    // Shortest prefix (at least 8) that is unique among the ids, like the console.
+    function shortIds(ids) {
+      const sorted = [...ids].sort();
+      const out = new Map();
+      const common = (a, b) => { let i = 0; while (i < a.length && a[i] === b[i]) i++; return i; };
+      sorted.forEach((id, i) => {
+        let length = 8;
+        if (i > 0) length = Math.max(length, common(id, sorted[i - 1]) + 1);
+        if (i + 1 < sorted.length) length = Math.max(length, common(id, sorted[i + 1]) + 1);
+        out.set(id, id.slice(0, length));
+      });
+      return out;
     }
 
     function fileHref(j, label) {
       return `/files?job=${encodeURIComponent(j.id)}&label=${encodeURIComponent(label)}`;
     }
 
-    let sortState = { key: 'experiment', asc: true };
-    let lastState = null;
+    function matches(j) {
+      if (filters.experiment && j.experiment !== filters.experiment) return false;
+      if (filters.host && j.host !== filters.host) return false;
+      if (filters.statuses.length && !filters.statuses.includes(j.status)) return false;
+      if (filters.since || filters.until) {
+        if (j.start_time === null || j.start_time === undefined) return false;
+        if (filters.since && j.start_time < new Date(filters.since).getTime() / 1000) return false;
+        if (filters.until && j.start_time >= new Date(filters.until).getTime() / 1000) return false;
+      }
+      if (filters.text) {
+        const needle = filters.text.toLowerCase();
+        if (![j.id, j.command, j.full_command].some((v) => String(v || "").toLowerCase().includes(needle))) return false;
+      }
+      return true;
+    }
 
-    // job_id -> { experiment: string, host: string, running: bool }
-    const jobMetaById = new Map();
+    function filtersActive() {
+      return Boolean(filters.experiment || filters.host || filters.since || filters.until || filters.text || filters.statuses.length);
+    }
+
+    function compare(a, b) {
+      const key = sortState.key;
+      let va = a[key], vb = b[key];
+      if (key === "start_time" || key === "end_time") {
+        va = va ?? Infinity; vb = vb ?? Infinity;
+        return sortState.asc ? va - vb : vb - va;
+      }
+      const c = String(va ?? "").localeCompare(String(vb ?? ""), undefined, { numeric: true });
+      return sortState.asc ? c : -c;
+    }
+
+    function fillSelect(el, values, current) {
+      const options = ['<option value="">all</option>']
+        .concat(values.map((v) => `<option value="${esc(v)}"${v === current ? " selected" : ""}>${esc(v)}</option>`));
+      if (el.innerHTML !== options.join("")) el.innerHTML = options.join("");
+    }
+
+    function renderFilters(state) {
+      const experiments = [...new Set(state.experiments.map((e) => e.name).concat(state.jobs.map((j) => j.experiment)))].sort();
+      fillSelect($("f-experiment"), experiments, filters.experiment);
+      fillSelect($("f-host"), state.hosts.map((h) => h.name).sort(), filters.host);
+      const chips = STATUSES.map((s) =>
+        `<label class="chip"><input type="checkbox" value="${s}"${filters.statuses.includes(s) ? " checked" : ""}>${s}</label>`
+      ).join("");
+      // NOTE: Only rebuild when it changed, so a click isn't lost mid-refresh.
+      if ($("f-statuses").dataset.html !== chips) {
+        $("f-statuses").innerHTML = chips;
+        $("f-statuses").dataset.html = chips;
+      }
+    }
+
+    function rowHtml(j, ids) {
+      const active = ACTIVE.includes(j.status);
+      const finished = FINISHED.includes(j.status);
+      const rc = j.returncode !== null && j.returncode !== undefined && j.returncode !== 0 ? ` (rc ${esc(j.returncode)})` : "";
+      const retries = j.retries ? ` · retry ${esc(j.retries)}` : "";
+      return `
+        <tr class="job" data-job-id="${esc(j.id)}">
+          <td class="check"><input type="checkbox" class="sel" ${selected.has(j.id) ? "checked" : ""}/></td>
+          <td><span class="kbd job-id" title="${esc(j.id)} (click to copy)">${esc(ids.get(j.id))}</span></td>
+          <td>
+            <span class="status"><span class="dot" style="background:${esc(j.status_color)}"></span>${esc(j.status)}${rc}${retries}</span>
+            ${j.message ? `<div class="small msg">${esc(j.message)}</div>` : ""}
+          </td>
+          <td><span class="pill">${esc(j.host || "—")}</span></td>
+          <td class="time">${esc(fmtTime(j.start_time))}</td>
+          <td class="time">${esc(fmtTime(j.end_time))}</td>
+          <td>
+            <div class="kbd">${esc(j.command)}</div>
+            <div class="links">${(j.files || []).map((label) =>
+              `<a href="${esc(fileHref(j, label))}" target="_blank" rel="noopener">${esc(label)}</a>`).join("")}</div>
+          </td>
+          <td class="actions">
+            <button type="button" class="row-btn danger" data-action="kill" ${active ? "" : "disabled"}>Kill</button>
+            <button type="button" class="row-btn" data-action="reset" ${finished ? "" : "disabled"}>Reset</button>
+            <button type="button" class="row-btn danger" data-action="delete" ${active ? "disabled" : ""}>Delete</button>
+          </td>
+        </tr>`;
+    }
+
+    function groupHtml(name, allJobs, shownJobs, ids) {
+      const counts = {};
+      allJobs.forEach((j) => { counts[j.status] = (counts[j.status] || 0) + 1; });
+      const summary = STATUSES.filter((s) => counts[s]).map((s) => `${counts[s]} ${s}`).join(" · ");
+      const isCollapsed = collapsed.has(name);
+      const anyActive = allJobs.some((j) => ACTIVE.includes(j.status));
+      const shownSelected = shownJobs.length > 0 && shownJobs.every((j) => selected.has(j.id));
+      const shownNote = shownJobs.length !== allJobs.length ? ` · ${shownJobs.length} shown` : "";
+      const head = `
+        <tr class="group" data-experiment="${esc(name)}">
+          <td class="check"><input type="checkbox" class="sel-group" ${shownSelected ? "checked" : ""}/></td>
+          <td colspan="6" class="group-title">
+            <span class="caret">${isCollapsed ? "▶" : "▼"}</span>
+            <strong>${esc(name)}</strong>
+            <span class="small">${allJobs.length} jobs${shownNote} — ${esc(summary)}</span>
+          </td>
+          <td class="actions">
+            <button type="button" class="group-btn danger" data-action="kill" ${anyActive ? "" : "disabled"} title="Kill this experiment's running jobs">Kill running</button>
+            <button type="button" class="group-btn danger" data-action="delete" ${anyActive ? "disabled" : ""} title="Forget this experiment and its jobs">Delete</button>
+          </td>
+        </tr>`;
+      if (isCollapsed) return head;
+      return head + [...shownJobs].sort(compare).map((j) => rowHtml(j, ids)).join("");
+    }
 
     function render(state) {
-      luEl.textContent = state.last_update_epoch ? fmtTime(state.last_update_epoch) : '—';
-      hostsEl.textContent = (state.hosts || [])
-        .map(h => `${h.name} (${h.state}${h.mode !== "active" ? ", " + h.mode : ""}, ${h.used}/${h.capacity})`)
-        .join(', ');
+      $("lu").textContent = state.last_update_epoch ? fmtTime(state.last_update_epoch) : "—";
+      $("hosts").innerHTML = (state.hosts || []).map((h) =>
+        `<span class="pill" title="${esc(h.domain)}${h.error ? " — " + esc(h.error) : ""}">${esc(h.name)} · ${esc(h.isa)} · ${esc(h.state)}${h.mode !== "active" ? " · " + esc(h.mode) : ""} · ${esc(h.used)}/${esc(h.capacity)}</span>`
+      ).join(" ") || "none";
 
-      const jobs = state.jobs || [];
-
-      // Sort jobs
-      jobs.sort((a, b) => {
-        const valA = String(a[sortState.key] || '').toLowerCase();
-        const valB = String(b[sortState.key] || '').toLowerCase();
-        const comparison = valA.localeCompare(valB, undefined, { numeric: true });
-        return sortState.asc ? comparison : -comparison;
+      renderFilters(state);
+      document.querySelectorAll("#table-head [data-sort-by]").forEach((th) => {
+        th.classList.toggle("sort-asc", th.dataset.sortBy === sortState.key && sortState.asc);
+        th.classList.toggle("sort-desc", th.dataset.sortBy === sortState.key && !sortState.asc);
       });
 
-      // Update sort indicators in headers
-      tableHeadEl.querySelectorAll('[data-sort-by]').forEach(th => {
-        th.classList.remove('sort-asc', 'sort-desc');
-        if (th.dataset.sortBy === sortState.key) {
-          th.classList.add(sortState.asc ? 'sort-asc' : 'sort-desc');
-        }
+      const ids = shortIds(state.jobs.map((j) => j.id));
+      const byExperiment = new Map();
+      state.experiments.forEach((e) => byExperiment.set(e.name, []));
+      state.jobs.forEach((j) => {
+        if (!byExperiment.has(j.experiment)) byExperiment.set(j.experiment, []);
+        byExperiment.get(j.experiment).push(j);
       });
 
-      jobMetaById.clear();
+      // Forget selections of jobs that no longer exist.
+      const existing = new Set(state.jobs.map((j) => j.id));
+      [...selected].forEach((id) => { if (!existing.has(id)) selected.delete(id); });
 
-      jobsEl.innerHTML = jobs.map((j) => {
-        const jobId = String(j.id ?? "");
-        const running = isRunningJob(j);
-        const resetable = canReset(j);
+      visibleIds = [];
+      const html = [];
+      [...byExperiment.keys()].sort().forEach((name) => {
+        const allJobs = byExperiment.get(name);
+        const shown = allJobs.filter(matches);
+        visibleIds.push(...shown.map((j) => j.id));
+        if (filtersActive() && shown.length === 0) return;
+        html.push(groupHtml(name, allJobs, shown, ids));
+      });
+      jobsEl.innerHTML = html.join("");
+      $("empty").classList.toggle("hidden", html.length > 0);
+      updateSelection();
 
-        jobMetaById.set(jobId, {
-          experiment: j.experiment ?? "",
-          host: j.host ?? "",
-          running,
-        });
+      $("scripts").innerHTML = (state.scripts || []).map((s) => `
+        <div class="script-row" data-script="${esc(s.path)}">
+          <span class="kbd">${esc(s.path)}</span>
+          <span class="small">${esc(s.jobs)} jobs</span>
+          <button type="button" class="script-btn danger" data-action="delete">Delete</button>
+        </div>`).join("") || '<div class="small">none</div>';
+      const deleted = [];
+      if (state.deleted_jobs) deleted.push(`${state.deleted_jobs} deleted job(s)`);
+      if ((state.deleted_experiments || []).length) deleted.push(`deleted experiments: ${state.deleted_experiments.join(", ")}`);
+      $("deleted").textContent = deleted.length ? `${deleted.join("; ")} — bring them back with \`undelete\` in the console.` : "";
+    }
 
-        const sigDisabledAttr = running ? "" : "disabled";
-        const resDisabledAttr = resetable ? "" : "disabled";
-
-        return `
-          <div class="row" data-job-id="${esc(jobId)}">
-            <div class="kbd" style="margin-bottom:6px;">${esc(j.experiment)}</div>
-
-            <div>
-              <div class="kbd">${esc(j.command)}</div>
-              <div class="links">
-                ${(j.files || []).map(label =>
-                  `<a href="${esc(fileHref(j, label))}" target="_blank" rel="noopener">${esc(label)}</a>`
-                ).join('')}
-              </div>
-            </div>
-
-            <div><span class="pill">${esc(j.host)}</span></div>
-
-            <div class="status">
-              <span class="dot" style="background:${esc(j.status_color)}"></span>${esc(j.status)}${j.returncode !== null && j.returncode !== 0 ? ` (rc ${esc(j.returncode)})` : ""}
-              ${j.message ? `<div class="small">${esc(j.message)}</div>` : ""}
-            </div>
-
-            <div class="actions">
-
-              <!-- Row 1 -->
-              <!-- <button class="sig-btn danger" data-sig="term" ${sigDisabledAttr} title="SIGTERM (15)">TERM</button> -->
-              <!-- <button class="sig-btn danger" data-sig="int"  ${sigDisabledAttr} title="SIGINT (2)">INT</button> -->
-              <!-- <button class="sig-btn danger" data-sig="quit" ${sigDisabledAttr} title="SIGQUIT (3)">QUIT</button> -->
-
-              <!-- Row 2 -->
-              <button class="sig-btn danger" data-sig="kill" ${sigDisabledAttr} title="SIGKILL (9)">KILL</button>
-              <button class="sig-btn" data-sig="reset" ${resDisabledAttr} title="RESET">RESET</button>
-            </div>
-          </div>`;
-      }).join('');
+    function updateSelection() {
+      $("sel-count").textContent = `${selected.size} selected`;
+      $("sel-matching").textContent = `Select all ${visibleIds.length} matching`;
+      document.querySelectorAll(".bulk-btn").forEach((b) => { b.disabled = selected.size === 0; });
     }
 
     async function postAction(payload) {
-      const r = await fetch("/api/job_action", {
+      const r = await fetch("/api/action", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-
       let body = null;
       try { body = await r.json(); } catch (_) {}
-
-      if (!r.ok) {
-        const msg = (body && body.error) ? body.error : (r.statusText || `HTTP ${r.status}`);
-        throw new Error(msg);
-      }
+      if (!r.ok) throw new Error((body && body.error) || r.statusText || `HTTP ${r.status}`);
       return body || {};
     }
 
-    jobsEl.addEventListener('click', async (ev) => {
-      const sigBtn = ev.target.closest('.sig-btn');
-      if (!sigBtn) return;
+    // Returns whether the action was sent and succeeded.
+    async function act(payload, question) {
+      if (question && !confirm(question)) return false;
+      let ok = false;
+      try {
+        const res = await postAction(payload);
+        showToast(res.message || "Done.", "ok", 4000);
+        ok = true;
+      } catch (e) {
+        showToast(`Action failed: ${e.message}`, "error", 6000);
+      }
+      tick();
+      return ok;
+    }
 
-      if (sigBtn.disabled) return;
+    const VERBS = { kill: "Send SIGKILL to", term: "Send SIGTERM to", int: "Send SIGINT to", quit: "Send SIGQUIT to", reset: "Reset", delete: "Delete" };
 
-      const row = sigBtn.closest('.row');
-      const job_id = String(row.dataset.jobId || "");
-      const meta = jobMetaById.get(job_id);
+    jobsEl.addEventListener("click", (ev) => {
+      const target = ev.target;
+      const row = target.closest("tr");
+      if (!row) return;
 
-      if (!job_id || !meta) {
-        showToast("Missing job metadata; refresh and try again.", "error", 4500);
+      if (row.classList.contains("group")) {
+        const name = row.dataset.experiment;
+        if (target.classList.contains("sel-group")) {
+          const jobs = lastState.jobs.filter((j) => j.experiment === name && matches(j));
+          jobs.forEach((j) => target.checked ? selected.add(j.id) : selected.delete(j.id));
+          render(lastState);
+          return;
+        }
+        const btn = target.closest(".group-btn");
+        if (btn) {
+          if (btn.dataset.action === "delete") {
+            act({ action: "delete", experiment: name }, `Delete experiment ${name} and all its jobs from the scheduler? Output files stay on disk.`);
+          } else {
+            const running = lastState.jobs.filter((j) => j.experiment === name && ACTIVE.includes(j.status)).map((j) => j.id);
+            act({ action: "kill", job_ids: running }, `Send SIGKILL to the ${running.length} running job(s) of ${name}?`);
+          }
+          return;
+        }
+        if (collapsed.has(name)) collapsed.delete(name); else collapsed.add(name);
+        save("collapsed", [...collapsed]);
+        render(lastState);
         return;
       }
 
-      const experiment = meta.experiment;
-      const host = meta.host;
-
-      let payload = null;
-
-      const signal = sigBtn.dataset.sig;
-
-      if (!meta.running && signal !== 'reset') return;
-
-      // Extra confirmation for SIGKILL
-      if (signal === "kill") {
-        const ok = confirm(
-          `Send SIGKILL to ${experiment} @ ${host}\n(job ${job_id.slice(0, 8)})?\nThis is immediate.`
-        );
-        if (!ok) return;
+      const jobId = row.dataset.jobId;
+      if (target.classList.contains("sel")) {
+        if (target.checked) selected.add(jobId); else selected.delete(jobId);
+        render(lastState);
+        return;
       }
-
-      payload = { signal, job_id };
-
-
-      // Disable row controls while request is in flight
-      const rowButtons = Array.from(row.querySelectorAll("button"));
-      rowButtons.forEach(b => b.disabled = true);
-
-      try {
-        const res = await postAction(payload);
-
-        showToast(res.message || "Done.", "ok", 2600);
-      } catch (e) {
-        console.error(e);
-        showToast(`Action failed: ${e.message}`, "error", 5000);
-      } finally {
-        rowButtons.forEach(b => b.disabled = false);
-
-        // Re-apply “signals disabled unless running” on this row
-        const fresh = jobMetaById.get(job_id);
-        const runningNow = fresh ? fresh.running : false;
-        row.querySelectorAll('.sig-btn[data-sig="kill"]').forEach(b => b.disabled = !runningNow);
+      if (target.classList.contains("job-id")) {
+        navigator.clipboard.writeText(jobId).then(
+          () => showToast(`Copied ${jobId}`, "ok", 2000),
+          () => showToast(jobId, "ok", 6000));
+        return;
+      }
+      const btn = target.closest(".row-btn");
+      if (btn) {
+        const action = btn.dataset.action;
+        const question = action === "reset" ? null : `${VERBS[action]} job ${jobId.slice(0, 8)}?`;
+        act({ action, job_ids: [jobId] }, question);
       }
     });
 
-    tableHeadEl.addEventListener('click', (ev) => {
-      const header = ev.target.closest('[data-sort-by]');
-      if (!header) return;
+    document.querySelectorAll(".bulk-btn").forEach((btn) => btn.addEventListener("click", () => {
+      const action = btn.dataset.action;
+      const ids = [...selected];
+      act({ action, job_ids: ids }, `${VERBS[action]} ${ids.length} selected job(s)?`)
+        .then((ok) => { if (ok && action === "delete") selected.clear(); });
+    }));
 
-      const key = header.dataset.sortBy;
-      if (sortState.key === key) {
-        sortState.asc = !sortState.asc;
-      } else {
-        sortState.key = key;
-        sortState.asc = true;
-      }
+    $("sel-matching").addEventListener("click", () => { visibleIds.forEach((id) => selected.add(id)); render(lastState); });
+    $("sel-clear").addEventListener("click", () => { selected.clear(); render(lastState); });
+    $("collapse-all").addEventListener("click", () => {
+      lastState.jobs.forEach((j) => collapsed.add(j.experiment));
+      lastState.experiments.forEach((e) => collapsed.add(e.name));
+      save("collapsed", [...collapsed]); render(lastState);
+    });
+    $("expand-all").addEventListener("click", () => { collapsed.clear(); save("collapsed", []); render(lastState); });
 
-      if (lastState) {
-        render(lastState);
-      }
+    $("scripts").addEventListener("click", (ev) => {
+      const btn = ev.target.closest(".script-btn");
+      if (!btn) return;
+      const path = btn.closest(".script-row").dataset.script;
+      act({ action: "delete", script: path }, `Delete script ${path}? Its jobs are forgotten and it won't be loaded again. Output files stay on disk.`);
+    });
+
+    function setFilter(key, value) {
+      filters[key] = value;
+      save("filters", filters);
+      if (lastState) render(lastState);
+    }
+    $("f-experiment").addEventListener("change", (e) => setFilter("experiment", e.target.value));
+    $("f-host").addEventListener("change", (e) => setFilter("host", e.target.value));
+    $("f-since").addEventListener("change", (e) => setFilter("since", e.target.value));
+    $("f-until").addEventListener("change", (e) => setFilter("until", e.target.value));
+    $("f-text").addEventListener("input", (e) => setFilter("text", e.target.value.trim()));
+    $("f-statuses").addEventListener("change", () => {
+      setFilter("statuses", [...document.querySelectorAll("#f-statuses input:checked")].map((i) => i.value));
+    });
+    $("f-clear").addEventListener("click", () => {
+      filters = { experiment: "", host: "", since: "", until: "", text: "", statuses: [] };
+      save("filters", filters);
+      $("f-since").value = ""; $("f-until").value = ""; $("f-text").value = "";
+      if (lastState) render(lastState);
+    });
+    $("f-since").value = filters.since; $("f-until").value = filters.until; $("f-text").value = filters.text;
+
+    $("table-head").addEventListener("click", (ev) => {
+      const th = ev.target.closest("[data-sort-by]");
+      if (!th) return;
+      const key = th.dataset.sortBy;
+      sortState = sortState.key === key ? { key, asc: !sortState.asc } : { key, asc: true };
+      save("sort", sortState);
+      if (lastState) render(lastState);
     });
 
     async function tick() {
       try {
-        const r = await fetch('/api/state', { cache: 'no-store' });
+        const r = await fetch("/api/state", { cache: "no-store" });
         const s = await r.json();
-        if (!r.ok) {
-          showToast(s.error || `HTTP ${r.status}`, "error", 5000);
-          return;
-        }
+        if (!r.ok) { showToast(s.error || `HTTP ${r.status}`, "error", 5000); return; }
         lastState = s;
         render(lastState);
       } catch (e) {
@@ -271,8 +453,14 @@
       }
     }
 
+    try {
+      lastState = JSON.parse($("initial-state").textContent);
+      render(lastState);
+    } catch (e) {
+      console.error(e);
+    }
     setInterval(tick, 2000);
-    window.addEventListener('load', tick);
+    window.addEventListener("load", tick);
   </script>
 </body>
 </html>

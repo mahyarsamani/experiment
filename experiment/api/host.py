@@ -15,6 +15,9 @@ from .worker import PROTOCOL_CONFIG
 
 MAX_BACKOFF = 60.0
 
+# NOTE: `uname -m` names, so a job can pick e.g. the matching venv or binary.
+ISAS = ("x86_64", "aarch64", "riscv64")
+
 
 class SIGNAL(Enum):
     TERM = 15
@@ -55,6 +58,7 @@ class Host:
     def __init__(
         self,
         name: str,
+        isa: str,
         domain: str,
         max_capacity: int,
         port: int = 9100,
@@ -65,13 +69,21 @@ class Host:
         insecure: bool = False,
     ) -> None:
         """
+        :param isa: the machine's architecture as `uname -m` prints it, one
+            of ISAS. Jobs can use it in `Job.compatible_with_host`.
         :param cert, key, ca: the scheduler's client certificate, its key,
             and the CA that signed the worker's certificate. Default to
             `scheduler.crt`, `scheduler.key` and `ca.crt` in the pki dir.
         :param insecure: connect without TLS. Only for a worker started with
             `--insecure-localhost` on this machine.
         """
+        if isa not in ISAS:
+            raise ValueError(
+                f"Host {name}: isa must be one of {', '.join(ISAS)}, "
+                f"not {isa!r}"
+            )
         self._name = name
+        self._isa = isa
         self._domain = domain
         self._max_capacity = max_capacity
         self._port = port
@@ -90,6 +102,9 @@ class Host:
 
     def name(self) -> str:
         return self._name
+
+    def isa(self) -> str:
+        return self._isa
 
     def domain(self) -> str:
         return self._domain
@@ -215,16 +230,15 @@ class Host:
             tuple((content, path.as_posix()) for _, content, path in job.dumps()),
         )
 
-    def statuses(
-        self, jobs: list[Job]
-    ) -> list[tuple[str, int | None, str | None]]:
+    def statuses(self, jobs: list[Job]) -> list[tuple]:
+        """(status, returncode, message, start_time, end_time) per job."""
         if not jobs:
             return []
-        return list(
-            self._call(
-                "job_statuses", tuple(job.outdir().as_posix() for job in jobs)
-            )
+        results = self._call(
+            "job_statuses", tuple(job.outdir().as_posix() for job in jobs)
         )
+        # NOTE: Workers older than the start/end times return 3-tuples.
+        return [tuple(result) + (None,) * (5 - len(result)) for result in results]
 
     def signal(self, job: Job, signum: int) -> bool:
         return bool(self._call("signal_job", job.outdir().as_posix(), signum))
@@ -239,6 +253,7 @@ class Host:
     def spec(self) -> dict:
         return {
             "name": self._name,
+            "isa": self._isa,
             "domain": self._domain,
             "max_capacity": self._max_capacity,
             "port": self._port,
@@ -252,6 +267,7 @@ class Host:
     def from_spec(cls, spec: dict) -> "Host":
         return cls(
             name=spec["name"],
+            isa=spec["isa"],
             domain=spec["domain"],
             max_capacity=spec["max_capacity"],
             port=spec["port"],
@@ -263,7 +279,7 @@ class Host:
 
     def __str__(self) -> str:
         return (
-            f"{self.__class__.__name__}(name={self._name}, "
+            f"{self.__class__.__name__}(name={self._name}, isa={self._isa}, "
             f"domain={self._domain}:{self._port}, "
             f"capacity={self._max_capacity})"
         )

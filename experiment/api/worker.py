@@ -67,38 +67,55 @@ def _leader_alive(launch: dict) -> bool:
         return True
 
 
-def resolve_status(outdir: Path) -> tuple[str, int | None, str | None]:
-    """Returns (status, returncode, message) for the job in `outdir`.
+Status = tuple[str, int | None, str | None, float | None, float | None]
 
-    status is one of "missing", "running", "exited", "failed", "killed".
+
+def resolve_status(outdir: Path) -> Status:
+    """Returns (status, returncode, message, start_time, end_time) for the
+    job in `outdir`. Times are epoch seconds on this machine's clock.
+
+    status is one of "missing", "running", "exited", "failed", "killed",
+    and "retry" (the job's watcher asked for it to be queued again).
     """
     job_dir = _job_dir(outdir)
     launch = read_json(job_dir / LAUNCH_FILE)
     if launch is None:
-        return "missing", None, None
+        return "missing", None, None, None, None
+    start = launch.get("start_time")
 
-    def from_exit(record: dict) -> tuple[str, int | None, str | None]:
+    def from_exit(record: dict) -> Status:
         rc = record.get("returncode")
+        end = record.get("end_time")
+        verdict = record.get("watcher")
+        if verdict:
+            status = "retry" if verdict["action"] == "retry" else "failed"
+            return status, rc, f"watcher: {verdict['message']}", start, end
         if rc == 0:
-            return "exited", rc, None
+            return "exited", rc, None, start, end
         if rc is not None and rc < 0 and -rc in record.get(
             "signals_received", []
         ):
-            return "killed", rc, f"stopped by signal {-rc}"
+            return "killed", rc, f"stopped by signal {-rc}", start, end
         if rc is not None and rc < 0:
-            return "failed", rc, f"terminated by signal {-rc}"
-        return "failed", rc, record.get("error")
+            return "failed", rc, f"terminated by signal {-rc}", start, end
+        return "failed", rc, record.get("error"), start, end
 
     record = read_json(job_dir / EXIT_FILE)
     if record is not None:
         return from_exit(record)
     if _leader_alive(launch):
-        return "running", None, None
+        return "running", None, None, start, None
     # NOTE: The runner may have written exit.json right after our first look.
     record = read_json(job_dir / EXIT_FILE)
     if record is not None:
         return from_exit(record)
-    return "killed", None, "ended without an exit record (e.g. SIGKILL)"
+    return (
+        "killed",
+        None,
+        "ended without an exit record (e.g. SIGKILL)",
+        start,
+        None,
+    )
 
 
 class Worker(rpyc.Service):
@@ -134,7 +151,7 @@ class Worker(rpyc.Service):
         job_dir = _job_dir(out)
         job_dir.mkdir(parents=True, exist_ok=True)
 
-        status, _, _ = resolve_status(out)
+        status = resolve_status(out)[0]
         if status == "running":
             raise RuntimeError(f"a job is already running in {out}")
         for name in (LAUNCH_FILE, EXIT_FILE):
@@ -164,6 +181,8 @@ class Worker(rpyc.Service):
                     str(out),
                     "--cwd",
                     str(cwd),
+                    "--job-id",
+                    str(job_id),
                     "--",
                     str(command),
                 ],

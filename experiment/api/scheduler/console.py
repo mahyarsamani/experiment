@@ -35,6 +35,7 @@ from .daemon import (
     DEFAULT_POLLING_SECS,
     spawn_daemon,
 )
+from .filters import JobFilter, format_time
 from .state import InstanceLock, socket_path
 
 SIGNALS = ("term", "int", "quit", "kill")
@@ -182,27 +183,50 @@ def build_parser() -> tuple[ConsoleParser, dict[str, ConsoleParser]]:
     add("hosts", "List hosts.")
     add("experiments", "List experiments.", ["exps"])
 
-    p = add("jobs", "List jobs.")
+    def filters(p, experiment: bool = True):
+        if experiment:
+            _arg(p, "--experiment", completer="experiment")
+        _arg(p, "--host", completer="host")
+        _arg(
+            p,
+            "--status",
+            action="append",
+            choices=STATUSES,
+            help="Repeat for several statuses.",
+        )
+        _arg(p, "--since", help="Started at or after: YYYY-MM-DD [HH:MM].")
+        _arg(p, "--until", help="Started before: YYYY-MM-DD [HH:MM].")
+        _arg(p, "--on", help="Started on this day: YYYY-MM-DD.")
+        _arg(p, "--match", help="Text in the job id or command.")
+
+    def confirm(p):
+        _arg(p, "-y", "--yes", action="store_true", help="Don't ask first.")
+
+    p = add("jobs", "List jobs, optionally filtered.")
     _arg(p, "experiment", nargs="?", completer="experiment")
-    _arg(p, "--status", choices=STATUSES)
-    _arg(p, "--host", completer="host")
+    filters(p, experiment=False)
     _arg(p, "--full", action="store_true", help="Show full ids and commands.")
 
-    p = add("signal", "Send a signal to running jobs.")
+    p = add(
+        "signal",
+        "Send a signal to running jobs: give job ids, or filters "
+        "(e.g. `signal kill --on 2026-10-09`).",
+    )
     _arg(p, "signal", choices=SIGNALS)
-    _arg(p, "jobs", nargs="+", completer="job", help="Job ids (or prefixes).")
+    _arg(p, "jobs", nargs="*", completer="job", help="Job ids (or prefixes).")
+    filters(p)
+    confirm(p)
 
     p = add("kill", "Kill all jobs of an experiment and remove it.")
     _arg(p, "experiment", completer="experiment")
 
     p = add(
         "reset",
-        "Queue finished jobs again. Give job ids, or --experiment "
-        "(all its finished jobs, or those with --status).",
+        "Queue finished jobs again: give job ids, or filters "
+        "(e.g. `reset --experiment e --status failed`).",
     )
     _arg(p, "jobs", nargs="*", completer="job")
-    _arg(p, "--experiment", completer="experiment")
-    _arg(p, "--status", choices=("exited", "failed", "killed", "unknown"))
+    filters(p)
     _arg(
         p,
         "--force",
@@ -210,6 +234,22 @@ def build_parser() -> tuple[ConsoleParser, dict[str, ConsoleParser]]:
         help="Also requeue jobs whose host is unreachable (they may still "
         "be running there).",
     )
+    confirm(p)
+
+    p = add(
+        "delete",
+        "Forget jobs that aren't running (output files stay on disk): give "
+        "job ids or filters; `--experiment E` alone deletes the experiment; "
+        "`--script S` deletes a script's jobs and stops loading it.",
+    )
+    _arg(p, "jobs", nargs="*", completer="job")
+    _arg(p, "--script", completer="script", help="A loaded script.")
+    filters(p)
+    confirm(p)
+
+    p = add("undelete", "Stop skipping deleted jobs or an experiment.")
+    _arg(p, "jobs", nargs="*", completer="deleted_job")
+    _arg(p, "--experiment", completer="deleted_experiment")
 
     p = add("drain", "Stop giving new jobs to a host.")
     _arg(p, "host", completer="host")
@@ -395,6 +435,7 @@ class Console:
         self._stop = threading.Event()
         self._told_not_running = False
         self._name = restart_args.get("name", "scheduler")
+        self._session: PromptSession | None = None
 
     # -- completion data --
 
@@ -419,6 +460,21 @@ class Console:
             return [
                 (ids[job["id"]], f"{job['status']}: {job['command']}")
                 for job in jobs
+            ]
+        info = snapshot["info"]
+        if kind == "script":
+            return [
+                (path, f"{info.get('script_jobs', {}).get(path, 0)} jobs")
+                for path in info.get("scripts", [])
+            ]
+        if kind == "deleted_job":
+            deleted = info.get("deleted_jobs", [])
+            ids = short_ids(deleted)
+            return [(ids[job_id], "deleted") for job_id in deleted]
+        if kind == "deleted_experiment":
+            return [
+                (name, "deleted")
+                for name in info.get("deleted_experiments", [])
             ]
         return []
 
@@ -480,10 +536,20 @@ class Console:
         hosts = self._client.snapshot(max_age=0)["hosts"]
         print(
             table(
-                ["host", "domain", "state", "mode", "used", "jobs", "error"],
+                [
+                    "host",
+                    "isa",
+                    "domain",
+                    "state",
+                    "mode",
+                    "used",
+                    "jobs",
+                    "error",
+                ],
                 [
                     [
                         h["name"],
+                        h.get("isa", ""),
                         h["domain"],
                         h["state"],
                         h["mode"],
@@ -523,26 +589,31 @@ class Console:
     def _print_jobs(self, args) -> None:
         jobs = self._client.snapshot(max_age=0)["jobs"]
         ids = short_ids([job["id"] for job in jobs])
-        jobs = [
-            job
-            for job in jobs
-            if (args.experiment is None or job["experiment"] == args.experiment)
-            and (args.status is None or job["status"] == args.status)
-            and (args.host is None or job["host"] == args.host)
-        ]
+        jobs = self._filter(args, args.experiment).select(jobs)
         if not jobs:
             print("no matching jobs")
             return
         width = 10_000 if args.full else 60
         print(
             table(
-                ["id", "status", "rc", "host", "experiment", "command"],
+                [
+                    "id",
+                    "status",
+                    "rc",
+                    "host",
+                    "started",
+                    "ended",
+                    "experiment",
+                    "command",
+                ],
                 [
                     [
                         job["id"] if args.full else ids[job["id"]],
                         job["status"],
                         job["returncode"],
                         job["host"],
+                        format_time(job.get("start_time")),
+                        format_time(job.get("end_time")),
                         job["experiment"],
                         job["full_command"] if args.full else job["command"],
                     ]
@@ -551,6 +622,7 @@ class Console:
                 max_width=width,
             )
         )
+        print(f"{len(jobs)} job(s)")
 
     def _print_events(self, args) -> None:
         events = self._client.events(0)[-max(1, args.n) :]
@@ -601,8 +673,71 @@ class Console:
         print("Tab completes commands, paths, and experiment/host/job names.")
 
     def _execute(self, name: str, **kwargs) -> None:
-        for line in self._client.execute(name, **kwargs):
+        lines = self._client.execute(name, **kwargs)
+        # NOTE: Bulk actions report each skipped job; keep it readable.
+        if len(lines) > 12:
+            lines = lines[:10] + [f"... {len(lines) - 11} more"] + lines[-1:]
+        for line in lines:
             print(line)
+
+    def _confirm(self, question: str) -> bool:
+        ask = self._session.prompt if self._session else input
+        return ask(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+
+    @staticmethod
+    def _filter(args, experiment: str | None = None) -> JobFilter:
+        return JobFilter.from_args(
+            experiment=experiment,
+            host=args.host,
+            statuses=args.status or (),
+            since=args.since,
+            until=args.until,
+            on=args.on,
+            text=args.match,
+        )
+
+    def _select(self, args, verb: str) -> list[str] | None:
+        """Job ids from `args.jobs` plus whatever the filters match.
+        Returns None if the user declined the confirmation."""
+        selector = self._filter(args, getattr(args, "experiment", None))
+        ids = list(args.jobs)
+        if not selector.empty():
+            jobs = self._client.snapshot(max_age=0)["jobs"]
+            matched = [job["id"] for job in selector.select(jobs)]
+            if not matched and not ids:
+                raise ConsoleError("no jobs match these filters")
+            if len(matched) > 1 and not args.yes:
+                if not self._confirm(f"{verb} {len(matched)} jobs?"):
+                    return None
+            ids += matched
+        if not ids:
+            raise ConsoleError("give job ids or filters (see `help`)")
+        return ids
+
+    def _delete(self, args) -> None:
+        if args.script:
+            script = Path(args.script).expanduser().resolve()
+            if not args.yes and not self._confirm(
+                f"delete script {script} and its jobs?"
+            ):
+                return
+            self._execute("delete", script=str(script))
+            return
+        only_experiment = (
+            args.experiment is not None
+            and not args.jobs
+            and self._filter(args).empty()
+        )
+        if only_experiment:
+            if not args.yes and not self._confirm(
+                f"delete experiment {args.experiment} and all its jobs?"
+            ):
+                return
+            self._execute("delete", experiment=args.experiment)
+            return
+        ids = self._select(args, "delete")
+        if ids is not None:
+            self._execute("delete", jobs=ids)
 
     def dispatch(self, args) -> bool:
         """Run one command. Returns False when the console should exit."""
@@ -636,16 +771,20 @@ class Console:
             script = Path(args.script).expanduser().resolve()
             self._execute(canonical, script=str(script))
         elif canonical == "signal":
-            self._execute("signal", jobs=args.jobs, signal=args.signal)
+            ids = self._select(args, f"send {args.signal} to")
+            if ids is not None:
+                self._execute("signal", jobs=ids, signal=args.signal)
         elif canonical == "kill":
             self._execute("kill", experiment=args.experiment)
         elif canonical == "reset":
+            ids = self._select(args, "reset")
+            if ids is not None:
+                self._execute("reset", jobs=ids, force=args.force)
+        elif canonical == "delete":
+            self._delete(args)
+        elif canonical == "undelete":
             self._execute(
-                "reset",
-                jobs=args.jobs,
-                experiment=args.experiment,
-                status=args.status,
-                force=args.force,
+                "undelete", jobs=args.jobs, experiment=args.experiment
             )
         elif canonical in ("drain", "undrain"):
             self._execute(canonical, host=args.host)
@@ -667,6 +806,8 @@ class Console:
             auto_suggest=AutoSuggestFromHistory(),
             complete_while_typing=True,
         )
+        # NOTE: A plain session (no completion or history) for y/N questions.
+        self._session = PromptSession()
         if self._client.connected():
             self._on_connected()
             self._last_seq = self._client.last_event()

@@ -45,7 +45,8 @@ def test_missing_cwd_fails_the_job(tmp_path):
     worker.exposed_launch_job(
         "job", str(tmp_path / "nope"), "true", str(outdir), (), ()
     )
-    status, returncode, message = wait_for(outdir, "failed")
+    status, returncode, message, start, end = wait_for(outdir, "failed")
+    assert start is not None and end >= start
     assert returncode == 127 and "could not start" in message
 
 
@@ -62,7 +63,7 @@ def test_signal_marks_job_killed(tmp_path, signum):
 def test_crash_is_failed_not_killed(tmp_path):
     worker = Worker()
     outdir = launch(worker, tmp_path, "segv", "kill -SEGV $$")
-    status, _, message = wait_for(outdir, "failed")
+    status, _, message, _, _ = wait_for(outdir, "failed")
     assert "signal 11" in message
 
 

@@ -66,8 +66,10 @@ class FakeConnection:
         pass
 
 
-def make_host(root: FakeRoot, name: str = "h", capacity: int = 2) -> Host:
-    host = Host(name, "localhost", capacity, insecure=True)
+def make_host(
+    root: FakeRoot, name: str = "h", capacity: int = 2, isa: str = "x86_64"
+) -> Host:
+    host = Host(name, isa, "localhost", capacity, insecure=True)
 
     def open_fake():
         root._check()
@@ -259,3 +261,121 @@ def test_commands_from_other_threads(tmp_path):
         scheduler.stop()
         thread.join(5)
     assert not thread.is_alive()
+
+
+def test_watcher_retries_then_gives_up(tmp_path):
+    root = FakeRoot()
+    experiment = make_experiment("e", 1, tmp_path)
+    scheduler, _ = make_scheduler(tmp_path, root, [experiment])
+    job = experiment.jobs()[0]
+    outdir = str(job.outdir())
+    launches = []
+    original = root.launch_job
+
+    def count_launch(*args):
+        launches.append(args[0])
+        return original(*args)
+
+    root.launch_job = count_launch
+    root.job_statuses = lambda outdirs: tuple(
+        (root.status.get(o, "missing"), 1, "watcher: flaky", None, None)
+        for o in outdirs
+    )
+    scheduler._tick()
+    for attempt in range(1, job.max_retries + 2):
+        assert job.status() == JobStatus.RUNNING
+        root.status[outdir] = "retry"
+        # NOTE: A retried job is queued and relaunched in the same tick.
+        scheduler._tick()
+        if attempt <= job.max_retries:
+            assert job.retries() == attempt
+            assert len(launches) == attempt + 1
+    assert job.status() == JobStatus.FAILED
+    assert "gave up after 3 retries" in job.message()
+    assert len(launches) == job.max_retries + 1
+
+    run(scheduler, "reset", jobs=[job.id()])
+    assert job.retries() == 0 and job.status() == JobStatus.QUEUED
+
+
+def test_retries_survive_a_restart(tmp_path):
+    job = make_experiment("e", 1, tmp_path).jobs()[0]
+    job.assign("h")
+    job.retry("flaky")
+    restored = make_experiment("e", 1, tmp_path).jobs()[0]
+    restored.restore_runtime_state(job.runtime_state())
+    assert restored.retries() == 1
+
+
+def test_host_isa_is_required_and_checked():
+    assert Host("a", "aarch64", "localhost", 4).isa() == "aarch64"
+    with pytest.raises(ValueError, match="isa must be one of"):
+        Host("a", 9101, "localhost", 4)
+    spec = Host("a", "x86_64", "localhost", 4).spec()
+    assert Host.from_spec(spec).isa() == "x86_64"
+
+
+class ArmOnlyJob(Job):
+    def compatible_with_host(self, host):
+        return host.isa() == "aarch64"
+
+
+class BrokenCheckJob(Job):
+    def compatible_with_host(self, host):
+        raise RuntimeError("oops")
+
+
+def make_job(cls, name, tmp_path):
+    return cls(
+        "e", tmp_path, name, name, tmp_path / "e" / name, 1, f"{name}-id"
+    )
+
+
+def test_jobs_only_run_on_compatible_hosts(tmp_path):
+    experiment = Experiment("e", tmp_path / "e")
+    arm = make_job(ArmOnlyJob, "arm", tmp_path)
+    broken = make_job(BrokenCheckJob, "broken", tmp_path)
+    plain = make_job(Job, "plain", tmp_path)
+    for job in (arm, broken, plain):
+        experiment.register_job(job)
+    x86_root, arm_root = FakeRoot(), FakeRoot()
+    scheduler, _ = make_scheduler(tmp_path, x86_root, [experiment])
+    arm_host = make_host(arm_root, name="arm-host", isa="aarch64")
+    scheduler._add_host(arm_host)
+    assert arm_host.connect()
+
+    scheduler._tick()
+    assert arm.host() == "arm-host"
+    assert plain.status() == JobStatus.RUNNING
+    assert broken.status() == JobStatus.QUEUED
+    views = {job["id"]: job for job in scheduler.snapshot().jobs}
+    assert views["broken-id"]["message"] == "no compatible host"
+    assert any(
+        "compatible_with_host" in event[3]
+        for event in scheduler.events().since(0)
+    )
+
+
+def test_start_and_end_times_come_from_the_worker(tmp_path):
+    root = FakeRoot()
+    times = {}
+    root.job_statuses = lambda outdirs: tuple(
+        (root.status.get(o, "missing"), 0, None, *times.get(o, (None, None)))
+        for o in outdirs
+    )
+    experiment = make_experiment("e", 1, tmp_path)
+    store = StateStore("test")
+    scheduler, _ = make_scheduler(tmp_path, root, [experiment], store=store)
+    scheduler._tick()
+    job = experiment.jobs()[0]
+    outdir = str(job.outdir())
+    times[outdir] = (100.0, None)
+    scheduler._tick()
+    assert (job.start_time(), job.end_time()) == (100.0, None)
+    root.status[outdir], times[outdir] = "exited", (100.0, 160.0)
+    scheduler._tick()
+    assert (job.start_time(), job.end_time()) == (100.0, 160.0)
+    scheduler._persist(force=True)
+    saved = store.load()["jobs"][job.id()]
+    assert (saved["start_time"], saved["end_time"]) == (100.0, 160.0)
+    assert job.reset() and job.start_time() is None

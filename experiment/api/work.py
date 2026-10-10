@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import json
+
 from enum import Enum
 from pathlib import Path
-from typing import Iterable, Sequence, Tuple
+from typing import TYPE_CHECKING, Callable, Iterable, Sequence, Tuple
+
+if TYPE_CHECKING:
+    from .host import Host
 
 
 class JobStatus(Enum):
@@ -77,6 +82,40 @@ class Job:
         self._host_name: str | None = None
         self._returncode: int | None = None
         self._message: str | None = None
+        # NOTE: Epoch seconds on the worker's clock, from the job's records.
+        self._start_time: float | None = None
+        self._end_time: float | None = None
+        # NOTE: Requeues asked for by the watcher since the last `reset`.
+        self._retries = 0
+
+    # NOTE: Watcher settings; override in a subclass along with `watcher`.
+    watch_interval = 60
+    watch_timeout = 60
+    max_retries = 3
+
+    def compatible_with_host(self, host: "Host") -> bool:
+        """Whether this job may run on `host`. Override to restrict it,
+        e.g. `return host.isa() == "aarch64"`."""
+        return True
+
+    def watcher(self) -> str | None:
+        """A script that checks on this job, or None for no checks.
+
+        The worker's runner runs it every `watch_interval` seconds while the
+        job runs (killing it after `watch_timeout` seconds), and once after
+        the job ends. It runs with bash, or with its own interpreter if it
+        starts with `#!`, in the job's outdir, with JOB_OUTDIR, JOB_ID,
+        JOB_PID, JOB_ELAPSED, JOB_RUNNING (1 or 0) and, after the job ends,
+        JOB_EXIT_CODE set. The first line it prints decides:
+
+            nothing or "ok"     keep going
+            "fail <message>"    kill the job; it ends as failed
+            "retry <message>"   kill the job and queue it again, at most
+                                `max_retries` times, then it fails
+
+        Its stderr and every verdict go to .job/watcher.log.
+        """
+        pass
 
     def experiment(self) -> str:
         return self._experiment
@@ -100,15 +139,36 @@ class Job:
         return self._demand
 
     def files(self) -> Tuple[Tuple[str, Path], ...]:
+        job_dir = self._outdir / ".job"
+        watcher = (
+            (
+                ("watcher", job_dir / "watcher"),
+                ("watcher.log", job_dir / "watcher.log"),
+            )
+            if self.watcher() is not None
+            else ()
+        )
         return (
             ("stdout", self._outdir / "stdout"),
             ("stderr", self._outdir / "stderr"),
             *self._aux_files,
             *((label, path) for label, _, path in self._dumps),
+            *watcher,
         )
 
     def dumps(self) -> Tuple[Tuple[str, str, Path], ...]:
-        return self._dumps
+        script = self.watcher()
+        if script is None:
+            return self._dumps
+        job_dir = self._outdir / ".job"
+        config = json.dumps(
+            {"interval": self.watch_interval, "timeout": self.watch_timeout}
+        )
+        return (
+            *self._dumps,
+            ("watcher", script, job_dir / "watcher"),
+            ("watcher config", config, job_dir / "watcher.json"),
+        )
 
     def status(self) -> JobStatus:
         return self._status
@@ -122,6 +182,12 @@ class Job:
     def message(self) -> str | None:
         return self._message
 
+    def start_time(self) -> float | None:
+        return self._start_time
+
+    def end_time(self) -> float | None:
+        return self._end_time
+
     def set_status(
         self,
         status: JobStatus,
@@ -134,19 +200,45 @@ class Job:
         if message is not None:
             self._message = message
 
+    def set_times(self, start: float | None, end: float | None) -> None:
+        if start is not None:
+            self._start_time = start
+        if end is not None:
+            self._end_time = end
+
+    def _clear_run(self) -> None:
+        self._returncode = None
+        self._message = None
+        self._start_time = None
+        self._end_time = None
+
     def assign(self, host_name: str) -> None:
         self._host_name = host_name
         self._status = JobStatus.LAUNCHING
-        self._returncode = None
-        self._message = None
+        self._clear_run()
 
     def reset(self) -> bool:
         if self._status.active():
             return False
         self._status = JobStatus.QUEUED
         self._host_name = None
-        self._returncode = None
-        self._message = None
+        self._clear_run()
+        self._retries = 0
+        return True
+
+    def retries(self) -> int:
+        return self._retries
+
+    def retry(self, message: str) -> bool:
+        """Queue the job again for its watcher, unless it has used up
+        `max_retries`. Returns whether it was queued."""
+        if self._retries >= self.max_retries:
+            return False
+        self._retries += 1
+        self._status = JobStatus.QUEUED
+        self._host_name = None
+        self._clear_run()
+        self._message = f"retry {self._retries}/{self.max_retries}: {message}"
         return True
 
     def forget(self) -> None:
@@ -162,6 +254,9 @@ class Job:
             "host": self._host_name,
             "returncode": self._returncode,
             "message": self._message,
+            "start_time": self._start_time,
+            "end_time": self._end_time,
+            "retries": self._retries,
         }
 
     def restore_runtime_state(self, state: dict) -> None:
@@ -174,6 +269,9 @@ class Job:
         self._host_name = state.get("host")
         self._returncode = state.get("returncode")
         self._message = state.get("message")
+        self._start_time = state.get("start_time")
+        self._end_time = state.get("end_time")
+        self._retries = state.get("retries", 0)
 
     def view(self) -> dict:
         return {
@@ -187,6 +285,9 @@ class Job:
             "status_color": self._status.color(),
             "returncode": self._returncode,
             "message": self._message or "",
+            "start_time": self._start_time,
+            "end_time": self._end_time,
+            "retries": self._retries,
             "files": [label for label, _ in self.files()],
             "outdir": str(self._outdir),
         }
@@ -223,16 +324,25 @@ class Experiment:
     def jobs(self) -> list[Job]:
         return list(self._jobs.values())
 
+    def remove_job(self, job_id: str) -> None:
+        self._jobs.pop(job_id, None)
+
     def job(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
 
-    def candidate(self, capacity: int) -> Job | None:
+    def candidate(
+        self,
+        capacity: int,
+        accepts: Callable[[Job], bool] = lambda job: True,
+    ) -> Job | None:
+        """The largest queued job that fits in `capacity` and `accepts`."""
         return max(
             (
                 job
                 for job in self._jobs.values()
                 if job.status() == JobStatus.QUEUED
                 and job.demand() <= capacity
+                and accepts(job)
             ),
             key=lambda j: j.demand(),
             default=None,

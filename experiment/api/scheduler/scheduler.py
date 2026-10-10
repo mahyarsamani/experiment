@@ -180,6 +180,11 @@ class Scheduler:
         self._jobs: dict[str, Job] = dict()
         self._killing: set[str] = set()
         self._scripts: dict[str, str] = dict()
+        # NOTE: The script that first defined each job, for `delete --script`.
+        self._job_origin: dict[str, str] = dict()
+        # NOTE: Deleted by the user; loading a script skips them.
+        self._deleted_jobs: set[str] = set()
+        self._deleted_experiments: set[str] = set()
         self._dirty = True
 
         self._connect_pool = ThreadPoolExecutor(
@@ -187,6 +192,8 @@ class Scheduler:
         )
         self._connecting: dict[str, Future] = dict()
         self._reported_errors: dict[str, str | None] = dict()
+        # NOTE: Jobs whose compatible_with_host raised, reported once each.
+        self._bad_compatibility: set[str] = set()
 
         self._commands: Queue[Command] = Queue()
         self._stop = threading.Event()
@@ -205,6 +212,8 @@ class Scheduler:
             "signal": self._cmd_signal,
             "reset": self._cmd_reset,
             "stop": self._cmd_stop,
+            "delete": self._cmd_delete,
+            "undelete": self._cmd_undelete,
         }
 
     # ---- Thread-safe interface -------------------------------------------
@@ -413,8 +422,15 @@ class Scheduler:
         except JobError as e:
             self._events.error(f"Polling {host.name()} failed: {e}")
             return
-        for job, (status, returncode, message) in zip(jobs, results):
+        for job, (status, returncode, message, start, end) in zip(
+            jobs, results
+        ):
             before = job.status()
+            if (start, end) != (job.start_time(), job.end_time()) and (
+                start is not None or end is not None
+            ):
+                job.set_times(start, end)
+                self._dirty = True
             if status == "missing":
                 if before == JobStatus.UNKNOWN:
                     # NOTE: The host has no record of this job, so it never
@@ -432,10 +448,16 @@ class Scheduler:
                     )
                 self._dirty = True
                 continue
+            if status == "retry":
+                self._retry(job, host, message or "watcher asked to retry")
+                continue
             new = job_status_from_worker(status)
             if new is None or new == before:
                 continue
             job.set_status(new, returncode, message)
+            if new.terminal() and job.end_time() is None:
+                # NOTE: No exit record (e.g. SIGKILL): when we noticed.
+                job.set_times(None, time.time())
             self._dirty = True
             if new == JobStatus.RUNNING:
                 self._events.info(
@@ -456,6 +478,27 @@ class Scheduler:
                     f"Job {job.id()[:8]} ({job.shorthand_command()}) was killed"
                     + (f": {message}" if message else ".")
                 )
+
+    def _retry(self, job: Job, host: Host, message: str) -> None:
+        self._dirty = True
+        if job.retry(message):
+            self._events.warn(
+                f"Job {job.id()[:8]} ({job.shorthand_command()}) on "
+                f"{host.name()}: {message}; queued it again "
+                f"({job.retries()}/{job.max_retries})."
+            )
+            return
+        job.set_status(
+            JobStatus.FAILED,
+            message=f"{message} (gave up after {job.max_retries} retries)",
+        )
+        if job.end_time() is None:
+            job.set_times(None, time.time())
+        self._events.error(
+            f"Job {job.id()[:8]} ({job.shorthand_command()}) on "
+            f"{host.name()}: {message}; gave up after {job.max_retries} "
+            "retries."
+        )
 
     def _process_killing(self) -> None:
         for name in list(self._killing):
@@ -482,7 +525,15 @@ class Scheduler:
         experiment = self._experiments.pop(name)
         self._killing.discard(name)
         for job in experiment.jobs():
-            self._jobs.pop(job.id(), None)
+            self._forget_job(job)
+        self._dirty = True
+
+    def _forget_job(self, job: Job) -> None:
+        self._jobs.pop(job.id(), None)
+        self._job_origin.pop(job.id(), None)
+        experiment = self._experiments.get(job.experiment())
+        if experiment is not None:
+            experiment.remove_job(job.id())
         self._dirty = True
 
     def _process_host_removal(self) -> None:
@@ -523,7 +574,12 @@ class Scheduler:
                     (
                         candidate
                         for candidate in (
-                            experiment.candidate(free)
+                            experiment.candidate(
+                                free,
+                                lambda job, host=host: self._compatible(
+                                    job, host
+                                ),
+                            )
                             for experiment in experiments
                         )
                         if candidate is not None
@@ -539,6 +595,27 @@ class Scheduler:
                     used[host.name()] += job.demand()
                 if not host.up():
                     break
+
+    def _job_view(self, job: Job) -> dict:
+        view = job.view()
+        if job.status() == JobStatus.QUEUED and not any(
+            self._compatible(job, host) for host in self._hosts.values()
+        ):
+            view["message"] = "no compatible host"
+        return view
+
+    def _compatible(self, job: Job, host: Host) -> bool:
+        """`job.compatible_with_host(host)`; a raising check means no."""
+        try:
+            return bool(job.compatible_with_host(host))
+        except Exception as e:
+            if job.id() not in self._bad_compatibility:
+                self._bad_compatibility.add(job.id())
+                self._events.error(
+                    f"compatible_with_host of job {job.id()[:8]} raised "
+                    f"{type(e).__name__}: {e}; treating hosts as incompatible."
+                )
+            return False
 
     def _launch(self, host: Host, job: Job) -> None:
         job.assign(host.name())
@@ -568,6 +645,7 @@ class Scheduler:
         hosts = tuple(
             {
                 "name": name,
+                "isa": host.isa(),
                 "domain": host.domain(),
                 "state": str(host.state()),
                 "mode": str(self._host_mode[name]),
@@ -596,10 +674,22 @@ class Scheduler:
             )
         snapshot = Snapshot(
             taken_at=time.time(),
-            info=dict(self._info, scripts=sorted(self._scripts)),
+            info=dict(
+                self._info,
+                scripts=sorted(self._scripts),
+                script_jobs={
+                    path: sum(
+                        1 for origin in self._job_origin.values()
+                        if origin == path
+                    )
+                    for path in self._scripts
+                },
+                deleted_jobs=sorted(self._deleted_jobs),
+                deleted_experiments=sorted(self._deleted_experiments),
+            ),
             hosts=hosts,
             experiments=tuple(experiments),
-            jobs=tuple(job.view() for job in self._jobs.values()),
+            jobs=tuple(self._job_view(job) for job in self._jobs.values()),
             job_locations={
                 job_id: (job.outdir(), job.host())
                 for job_id, job in self._jobs.items()
@@ -626,6 +716,8 @@ class Scheduler:
                 for name, host in self._hosts.items()
             },
             "killing": sorted(self._killing),
+            "deleted_jobs": sorted(self._deleted_jobs),
+            "deleted_experiments": sorted(self._deleted_experiments),
             "jobs": {
                 job_id: job.runtime_state()
                 for job_id, job in self._jobs.items()
@@ -645,6 +737,9 @@ class Scheduler:
         Jobs keep their saved status: only queued jobs are ever launched, so
         jobs that were running are checked with their host, never restarted.
         """
+        # NOTE: Before the scripts run, so they skip what was deleted.
+        self._deleted_jobs = set(data.get("deleted_jobs", []))
+        self._deleted_experiments = set(data.get("deleted_experiments", []))
         for script in data.get("scripts", []):
             path = Path(script["path"])
             try:
@@ -658,7 +753,16 @@ class Scheduler:
         for name, saved in data.get("hosts", {}).items():
             spec = saved["spec"]
             if name not in self._hosts:
-                self._add_host(Host.from_spec(spec))
+                try:
+                    host = Host.from_spec(spec)
+                except (KeyError, ValueError) as e:
+                    # NOTE: e.g. a host saved before hosts had an isa.
+                    self._events.warn(
+                        f"Not restoring host {name} from saved state ({e}); "
+                        "load a script that defines it."
+                    )
+                    continue
+                self._add_host(host)
             self._hosts[name].set_capacity(spec["max_capacity"])
             self._host_mode[name] = HostMode(saved["mode"])
 
@@ -709,10 +813,18 @@ class Scheduler:
             self._add_host(host)
             lines.append(f"added host {host.name()}")
 
+        origin = str(script)
+        skipped_deleted = 0
         for experiment in experiments:
             name = experiment.name()
             if name in self._killing:
                 lines.append(f"experiment {name} is being killed; skipped")
+                continue
+            if name in self._deleted_experiments:
+                lines.append(
+                    f"experiment {name} was deleted; skipped (`undelete "
+                    f"--experiment {name}` to bring it back)"
+                )
                 continue
             existing = self._experiments.get(name)
             if existing is not None and not merge:
@@ -727,6 +839,9 @@ class Scheduler:
                 lines.append(f"added experiment {name}")
             added = 0
             for job in experiment.jobs():
+                if job.id() in self._deleted_jobs:
+                    skipped_deleted += 1
+                    continue
                 owner = self._jobs.get(job.id())
                 if owner is not None:
                     if owner.experiment() != name:
@@ -737,10 +852,14 @@ class Scheduler:
                     continue
                 existing.register_job(job)
                 self._jobs[job.id()] = job
+                self._job_origin[job.id()] = origin
                 added += 1
             defined = {job.id() for job in experiment.jobs()}
             stale = [
-                job for job in existing.jobs() if job.id() not in defined
+                job
+                for job in existing.jobs()
+                if job.id() not in defined
+                and self._job_origin.get(job.id()) == origin
             ]
             lines.append(f"{name}: {added} new job(s)")
             if merge and stale:
@@ -748,8 +867,10 @@ class Scheduler:
                     f"{name}: {len(stale)} job(s) are no longer in the script "
                     "(kept)"
                 )
+        if skipped_deleted:
+            lines.append(f"{skipped_deleted} deleted job(s) skipped")
 
-        self._scripts[str(script)] = _sha256(script)
+        self._scripts[origin] = _sha256(script)
         self._dirty = True
         return lines
 
@@ -922,4 +1043,102 @@ class Scheduler:
                 "to pick them back up"
             )
         self._stop.set()
+        return lines
+
+    def _refuse_if_active(self, jobs: Iterable[Job], what: str) -> None:
+        active = [job for job in jobs if job.status().active()]
+        if active:
+            ids = ", ".join(job.id()[:8] for job in active[:10])
+            more = f" and {len(active) - 10} more" if len(active) > 10 else ""
+            raise CommandError(
+                f"can't delete {what}: {len(active)} job(s) are still "
+                f"running ({ids}{more}); kill them first"
+            )
+
+    def _cmd_delete(
+        self,
+        jobs: list[str] = (),
+        experiment: str | None = None,
+        script: str | None = None,
+    ) -> list[str]:
+        """Forget jobs, an experiment, or a script's jobs. Output files on
+        disk are never touched."""
+        if script is not None:
+            path = str(Path(script).expanduser().resolve())
+            if path not in self._scripts:
+                raise CommandError(f"{script} is not a loaded script")
+            owned = [
+                job
+                for job_id, job in self._jobs.items()
+                if self._job_origin.get(job_id) == path
+            ]
+            self._refuse_if_active(owned, f"script {script}")
+            touched = {job.experiment() for job in owned}
+            for job in owned:
+                self._forget_job(job)
+            emptied = [
+                name
+                for name in sorted(touched)
+                if name in self._experiments
+                and not self._experiments[name].jobs()
+            ]
+            for name in emptied:
+                self._remove_experiment(name)
+            del self._scripts[path]
+            self._dirty = True
+            return [
+                f"deleted script {script}: {len(owned)} job(s)"
+                + (f", experiment(s) {', '.join(emptied)}" if emptied else "")
+                + "; it won't be loaded again unless you `load` it"
+            ]
+
+        if experiment is not None:
+            target = self._experiment(experiment)
+            self._refuse_if_active(target.jobs(), f"experiment {experiment}")
+            count = len(target.jobs())
+            self._remove_experiment(experiment)
+            self._deleted_experiments.add(experiment)
+            return [f"deleted experiment {experiment} and its {count} job(s)"]
+
+        if not jobs:
+            raise CommandError("nothing to delete")
+        lines, deleted = [], 0
+        for prefix in jobs:
+            job = self._resolve_job(prefix)
+            if job.status().active():
+                lines.append(f"{job.id()[:8]}: skipped, it is {job.status()}")
+                continue
+            self._forget_job(job)
+            self._deleted_jobs.add(job.id())
+            deleted += 1
+        lines.append(f"deleted {deleted} job(s)")
+        return lines
+
+    def _cmd_undelete(
+        self, jobs: list[str] = (), experiment: str | None = None
+    ) -> list[str]:
+        """Stop skipping deleted jobs or an experiment, and reload every
+        loaded script so they come back."""
+        restored = 0
+        if experiment is not None:
+            if experiment not in self._deleted_experiments:
+                raise CommandError(f"experiment {experiment} isn't deleted")
+            self._deleted_experiments.discard(experiment)
+            restored += 1
+        for prefix in jobs:
+            matches = [i for i in self._deleted_jobs if i.startswith(prefix)]
+            if len(matches) != 1:
+                raise CommandError(
+                    f"{prefix!r} matches {len(matches)} deleted jobs"
+                )
+            self._deleted_jobs.discard(matches[0])
+            restored += 1
+        if not restored:
+            raise CommandError("nothing to undelete")
+        lines = []
+        for path in list(self._scripts):
+            try:
+                lines += self._load(Path(path), merge=True)
+            except Exception as e:
+                lines.append(f"reloading {path} failed: {e}")
         return lines

@@ -23,6 +23,15 @@ COOKIE = "experiment_dashboard"
 CHUNK = 256 * 1024
 
 
+def summarize(lines: list[str], keep: int = 3) -> str:
+    """A command's result lines, short enough for a toast."""
+    if len(lines) <= keep + 1:
+        return "; ".join(lines)
+    return "; ".join(
+        lines[:keep] + [f"… {len(lines) - keep - 1} more", lines[-1]]
+    )
+
+
 class Dashboard:
     def __init__(self, scheduler: Scheduler, port: int, title: str) -> None:
         self._scheduler = scheduler
@@ -48,6 +57,27 @@ class Dashboard:
 
     def shutdown(self) -> None:
         self._server.shutdown()
+
+    def _state(self) -> dict:
+        snapshot = self._scheduler.snapshot()
+        info = snapshot.info
+        return {
+            "title": self._title,
+            "hosts": list(snapshot.hosts),
+            "experiments": list(snapshot.experiments),
+            "jobs": list(snapshot.jobs),
+            "scripts": [
+                {"path": path, "jobs": info.get("script_jobs", {}).get(path, 0)}
+                for path in info.get("scripts", [])
+            ],
+            "deleted_jobs": len(info.get("deleted_jobs", [])),
+            "deleted_experiments": info.get("deleted_experiments", []),
+            "last_update_epoch": snapshot.taken_at,
+        }
+
+    def _call(self, name: str, **kwargs) -> list[str]:
+        # NOTE: Bulk actions on hundreds of jobs can take a few seconds.
+        return self._scheduler.call(name, timeout=60, **kwargs)
 
     def _authorized(self) -> bool:
         cookie = request.cookies.get(COOKIE, "")
@@ -104,45 +134,57 @@ class Dashboard:
 
         @app.get("/")
         def index():
-            return render_template("base.html", title=self._title)
+            # NOTE: The current state is embedded so the page renders right
+            # away instead of after its first /api/state poll.
+            return render_template(
+                "base.html", title=self._title, state=self._state()
+            )
 
         @app.get("/api/state")
         def api_state():
-            snapshot = self._scheduler.snapshot()
-            return jsonify(
-                {
-                    "title": self._title,
-                    "hosts": list(snapshot.hosts),
-                    "jobs": list(snapshot.jobs),
-                    "last_update_epoch": snapshot.taken_at,
-                }
-            )
+            return jsonify(self._state())
 
-        @app.post("/api/job_action")
-        def api_job_action():
+        @app.post("/api/action")
+        def api_action():
+            """One action on jobs, an experiment or a script.
+
+            {"action": "kill"|"term"|"int"|"quit"|"reset"|"delete",
+             "job_ids": [...]}, or {"action": "delete", "experiment": name},
+             or {"action": "delete", "script": path}.
+            """
             if not request.is_json:
                 abort(415, "expected application/json")
             data = request.get_json(silent=True) or {}
-            job_id = data.get("job_id")
-            action = data.get("signal")
-            if not isinstance(job_id, str) or not job_id:
-                abort(400, "missing job_id")
+            action = data.get("action")
+            job_ids = data.get("job_ids") or []
+            if not isinstance(job_ids, list) or not all(
+                isinstance(job_id, str) and job_id for job_id in job_ids
+            ):
+                abort(400, "job_ids must be a list of job ids")
+            experiment = data.get("experiment")
+            script = data.get("script")
             try:
-                if action == "reset":
-                    lines = self._scheduler.call(
-                        "reset", timeout=10, jobs=[job_id]
-                    )
+                if action == "delete" and script:
+                    lines = self._call("delete", script=str(script))
+                elif action == "delete" and experiment:
+                    lines = self._call("delete", experiment=str(experiment))
+                elif not job_ids:
+                    abort(400, "no jobs given")
+                elif action == "delete":
+                    lines = self._call("delete", jobs=job_ids)
+                elif action == "reset":
+                    lines = self._call("reset", jobs=job_ids)
                 elif action in Scheduler.SIGNALS:
-                    lines = self._scheduler.call(
-                        "signal", timeout=10, jobs=[job_id], signal=action
-                    )
+                    lines = self._call("signal", jobs=job_ids, signal=action)
                 else:
-                    abort(400, "invalid signal")
+                    abort(400, f"unknown action {action!r}")
             except CommandError as e:
                 abort(409, str(e))
             except TimeoutError:
                 abort(504, "the scheduler did not answer in time")
-            return jsonify({"ok": True, "message": "; ".join(lines)})
+            return jsonify(
+                {"ok": True, "message": summarize(lines), "lines": lines}
+            )
 
         @app.get("/files")
         def files():
