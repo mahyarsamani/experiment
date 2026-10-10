@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "experiment"
-version = "0.26.09.1"
+version = "0.26.10.1"
 description = "Experimentation tooling for gem5"
 license = { text = "MIT" }
 authors = [{ name = "Mahyar Samani", email = "msamani@ucdavis.edu" }]
