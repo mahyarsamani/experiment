@@ -1,11 +1,9 @@
 import argparse
 
-from ..common.cmd_util import run_command
-from ..common.config_util import configure_build_directory
+from ..api.build import Builder, BuildSpec
 from ..common.log import error
 from ..common.gem5_work import (
     BinaryOpt,
-    gem5BuildConfiguration,
     ISA,
     Protocol,
 )
@@ -84,40 +82,16 @@ def _process_build_args(proj_config, build_args, unknown_args) -> int:
         error(f"unrecognized arguments: {' '.join(unknown_args)}")
         return 2
 
-    build_dir = (
-        proj_config.path_config().gem5_binary_base_dir()
-        / build_args.build_name
+    spec = BuildSpec.from_project(
+        proj_config,
+        build_args.build_name,
+        isas=build_args.isas,
+        protocols=build_args.protocols,
+        binary_opt=build_args.binary_opt,
+        bits_per_set=build_args.bits_per_set,
+        linker=build_args.linker,
+        gprof=build_args.gprof,
+        no_tcmalloc=build_args.no_tcmalloc,
+        threads=build_args.threads,
     )
-
-    build_config = gem5BuildConfiguration.from_args_and_config(
-        build_args,
-        proj_config.build_config(),
-    )
-
-    returncode = configure_build_directory(
-        proj_config.path_config().gem5_source_dir(), build_dir, build_config
-    )
-    if returncode != 0:
-        error(f"scons setconfig failed with exit code {returncode}.")
-        return returncode
-
-    command = (
-        f"scons -C {proj_config.path_config().gem5_source_dir()} "
-        f"gem5.{build_config.binary_opt}"
-    )
-    if build_args.linker:
-        command += f" --linker={build_args.linker}"
-        linker_override_path = build_dir / "gem5.build" / "linker_override"
-        linker_override_path.unlink(missing_ok=True)
-        linker_override_path.touch()
-        linker_override_path.write_text(f"{build_args.linker}\n")
-    if build_args.gprof:
-        command += " --gprof"
-        (build_dir / "gem5.build" / "built_with_gprof").touch()
-    if build_args.no_tcmalloc:
-        command += " --without-tcmalloc"
-        (build_dir / "gem5.build" / "built_without_tcmalloc").touch()
-    if build_args.threads:
-        command += f" -j {build_args.threads}"
-
-    return run_command(["bash", "-c", command], build_dir)
+    return Builder(spec).run()

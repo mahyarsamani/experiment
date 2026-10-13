@@ -8,12 +8,8 @@ from importlib.resources import files
 from pathlib import Path
 
 from . import assets
-from .cmd_util import run_command
 from .log import warn
-from .gem5_work import (
-    gem5BuildConfiguration,
-    gem5ProjectConfiguration,
-)
+from .gem5_work import gem5ProjectConfiguration
 
 config_file_name = "project_config.json"
 gem5_repo_url = "https://github.com/gem5/gem5.git"
@@ -159,37 +155,3 @@ def initialize_directories(gem5_proj_config: gem5ProjectConfiguration):
         json.dump(
             gem5_proj_config.to_dict(), config_json, indent=2, default=str
         )
-
-
-def configure_build_directory(
-    gem5_source_dir: Path,
-    build_dir: Path,
-    build_config: gem5BuildConfiguration,
-) -> int:
-    """Run `scons setconfig` if needed. Returns its exit code (0 if skipped)."""
-    old_build_config_path = build_dir / "gem5.build" / "compile_config.json"
-
-    need_setconfig = True
-    if old_build_config_path.exists():
-        warn(f"{old_build_config_path} already exists. Checking for changes.")
-        with open(old_build_config_path, "r") as config_file:
-            old_build_config_dict = json.load(config_file)
-            need_setconfig = not build_config.is_same(old_build_config_dict)
-
-    if not need_setconfig:
-        warn("No need to set config as it matches current build config.")
-        return 0
-    else:
-        warn("Setting config as it does not match current build config.")
-        shutil.rmtree(build_dir, ignore_errors=True)
-        build_dir.mkdir(parents=True, exist_ok=True)
-        setconfig_cmd = build_config.make_setconfig_command(build_dir)
-        returncode = run_command(["bash", "-c", setconfig_cmd], gem5_source_dir)
-        if returncode != 0:
-            # NOTE: Don't record the config, so the next build retries it.
-            return returncode
-        with open(old_build_config_path, "w") as config_file:
-            json.dump(
-                build_config.dump_config(), config_file, indent=2, default=str
-            )
-    return 0

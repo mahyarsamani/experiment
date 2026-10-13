@@ -29,7 +29,7 @@ from ..host import (
     JobError,
     job_status_from_worker,
 )
-from ..work import Experiment, Job, JobStatus
+from ..work import Experiment, Job, JobStatus, PerHostJob
 from .state import StateStore
 
 
@@ -185,6 +185,14 @@ class Scheduler:
         # NOTE: Deleted by the user; loading a script skips them.
         self._deleted_jobs: set[str] = set()
         self._deleted_experiments: set[str] = set()
+        # NOTE: Per-host jobs by id; their instances are ordinary jobs in
+        # self._jobs, with ids PerHostJob.instance_id(template, host).
+        self._templates: dict[str, PerHostJob] = dict()
+        # NOTE: Each job's dependencies: (plain job ids, per-host job ids).
+        self._deps: dict[str, tuple[list[str], list[str]]] = dict()
+        # NOTE: Hosts where every per-host dependency of a job is done;
+        # missing means the job has no per-host dependencies.
+        self._ready_hosts: dict[str, set[str]] = dict()
         self._dirty = True
 
         self._connect_pool = ThreadPoolExecutor(
@@ -352,6 +360,7 @@ class Scheduler:
                 self._poll_host(host)
         self._process_killing()
         self._process_host_removal()
+        self._update_readiness()
         self._schedule()
         self._publish()
         self._persist()
@@ -363,12 +372,96 @@ class Scheduler:
             if job.host() == host_name and job.status().active()
         ]
 
+    def _demand(self, job: Job, host_name: str | None) -> int:
+        """Slots `job` takes on `host_name`. A job pinned to a host (e.g.
+        a per-host build) takes at most the whole host."""
+        host = self._hosts.get(host_name or "")
+        if job.pinned_host() is not None and host is not None:
+            return min(job.demand(), host.max_capacity())
+        return job.demand()
+
     def _used_capacity(self) -> dict[str, int]:
         used = {name: 0 for name in self._hosts}
         for job in self._jobs.values():
             if job.status().active() and job.host() in used:
-                used[job.host()] += job.demand()
+                used[job.host()] += self._demand(job, job.host())
         return used
+
+    def _update_readiness(self) -> None:
+        """Mark each pending job with dependencies queued, waiting or
+        blocked, and note the hosts where its per-host ones are done.
+
+        A job may run on host H when it is compatible with H, all its
+        plain dependencies exited, and all its per-host dependencies
+        exited on H.
+        """
+        self._ready_hosts.clear()
+        for job_id, (plain, per_host) in self._deps.items():
+            job = self._jobs.get(job_id)
+            if job is None or not job.status().pending():
+                continue
+            if not plain and not per_host:
+                continue
+            waiting, blocked = [], []
+            for parent_id in plain:
+                parent = self._jobs.get(parent_id)
+                if parent is None:
+                    blocked.append(f"{parent_id[:12]} was deleted")
+                elif parent.status() in (JobStatus.FAILED, JobStatus.KILLED):
+                    blocked.append(f"{parent_id[:12]} {parent.status()}")
+                elif parent.status() == JobStatus.BLOCKED:
+                    blocked.append(f"{parent_id[:12]} is blocked")
+                elif parent.status() != JobStatus.EXITED:
+                    waiting.append(parent_id[:12])
+            if per_host:
+                ready, possible = set(), False
+                for host in self._hosts.values():
+                    if not self._compatible(job, host):
+                        continue
+                    done = can = True
+                    for template_id in per_host:
+                        instance = self._jobs.get(
+                            PerHostJob.instance_id(template_id, host.name())
+                        )
+                        if instance is None or instance.status() in (
+                            JobStatus.FAILED,
+                            JobStatus.KILLED,
+                        ):
+                            done = can = False
+                            break
+                        if instance.status() != JobStatus.EXITED:
+                            done = False
+                    if done:
+                        ready.add(host.name())
+                    elif can:
+                        possible = True
+                self._ready_hosts[job_id] = ready
+                if not ready:
+                    names = ", ".join(per_host)
+                    if possible:
+                        waiting.append(f"{names} on a compatible host")
+                    else:
+                        blocked.append(
+                            f"no compatible host where {names} succeeded"
+                        )
+            if blocked:
+                status, reason = JobStatus.BLOCKED, "; ".join(blocked)
+            elif waiting:
+                status = JobStatus.WAITING
+                reason = "waiting for " + ", ".join(waiting)
+            else:
+                status, reason = JobStatus.QUEUED, None
+            if (job.status(), job.message()) != (status, reason):
+                job.set_pending(status, reason)
+                self._dirty = True
+
+    def _placeable(self, job: Job, host: Host) -> bool:
+        if job.pinned_host() not in (None, host.name()):
+            return False
+        ready = self._ready_hosts.get(job.id())
+        if ready is not None and host.name() not in ready:
+            return False
+        return self._compatible(job, host)
 
     def _reconnect_hosts(self) -> None:
         for name, future in list(self._connecting.items()):
@@ -526,11 +619,51 @@ class Scheduler:
         self._killing.discard(name)
         for job in experiment.jobs():
             self._forget_job(job)
+        for template_id, template in list(self._templates.items()):
+            if template.experiment() == name:
+                self._forget_template(template_id)
         self._dirty = True
+
+    def _forget_template(self, template_id: str) -> None:
+        self._templates.pop(template_id, None)
+        self._job_origin.pop(template_id, None)
+        self._dirty = True
+
+    def _pending_dependents(self, job_ids: set[str]) -> list[Job]:
+        """Jobs outside `job_ids` that haven't run yet and need one of
+        them (directly, or as the instance of a per-host job)."""
+        dependents = []
+        for job_id, (plain, per_host) in self._deps.items():
+            job = self._jobs.get(job_id)
+            if job is None or job_id in job_ids or not job.status().pending():
+                continue
+            if any(parent in job_ids for parent in plain) or any(
+                PerHostJob.instance_id(template, host) in job_ids
+                for template in per_host
+                for host in self._hosts
+            ):
+                dependents.append(job)
+        return dependents
+
+    def _refuse_if_needed(self, job_ids: set[str], what: str) -> None:
+        dependents = self._pending_dependents(job_ids)
+        if dependents:
+            ids = ", ".join(job.id()[:12] for job in dependents[:10])
+            more = (
+                f" and {len(dependents) - 10} more"
+                if len(dependents) > 10
+                else ""
+            )
+            raise CommandError(
+                f"can't delete {what}: {len(dependents)} job(s) that haven't "
+                f"run yet depend on it ({ids}{more}); delete them first"
+            )
 
     def _forget_job(self, job: Job) -> None:
         self._jobs.pop(job.id(), None)
         self._job_origin.pop(job.id(), None)
+        self._deps.pop(job.id(), None)
+        self._ready_hosts.pop(job.id(), None)
         experiment = self._experiments.get(job.experiment())
         if experiment is not None:
             experiment.remove_job(job.id())
@@ -570,21 +703,25 @@ class Scheduler:
             )
             for host in hosts:
                 free = host.max_capacity() - used[host.name()]
+                def demand(job, host=host):
+                    return self._demand(job, host.name())
+
                 job = max(
                     (
                         candidate
                         for candidate in (
                             experiment.candidate(
                                 free,
-                                lambda job, host=host: self._compatible(
+                                lambda job, host=host: self._placeable(
                                     job, host
                                 ),
+                                demand,
                             )
                             for experiment in experiments
                         )
                         if candidate is not None
                     ),
-                    key=lambda job: job.demand(),
+                    key=demand,
                     default=None,
                 )
                 if job is None:
@@ -592,16 +729,21 @@ class Scheduler:
                 progress = True
                 self._launch(host, job)
                 if job.status().active():
-                    used[host.name()] += job.demand()
+                    used[host.name()] += demand(job)
                 if not host.up():
                     break
 
     def _job_view(self, job: Job) -> dict:
         view = job.view()
         if job.status() == JobStatus.QUEUED and not any(
-            self._compatible(job, host) for host in self._hosts.values()
+            self._placeable(job, host) for host in self._hosts.values()
         ):
             view["message"] = "no compatible host"
+        plain, per_host = self._deps.get(job.id(), ([], []))
+        view["depends_on"] = list(plain)
+        view["depends_on_per_host"] = list(per_host)
+        ready = self._ready_hosts.get(job.id())
+        view["ready_hosts"] = sorted(ready) if ready is not None else None
         return view
 
     def _compatible(self, job: Job, host: Host) -> bool:
@@ -797,13 +939,117 @@ class Scheduler:
         self._hosts[host.name()] = host
         self._host_mode[host.name()] = HostMode.ACTIVE
         self._dirty = True
+        for template in self._templates.values():
+            self._instantiate(template, host)
+
+    @staticmethod
+    def _dependency_ids(job: Job) -> tuple[list[str], list[str]]:
+        plain = [p.id() for p in job.parents() if isinstance(p, Job)]
+        per_host = [p.id() for p in job.parents() if isinstance(p, PerHostJob)]
+        return plain, per_host
+
+    def _record_dependencies(self, job: Job) -> None:
+        self._deps[job.id()] = self._dependency_ids(job)
+
+    def _instantiate(self, template: PerHostJob, host: Host) -> None:
+        """Make `template`'s job for `host`, if it runs there."""
+        job_id = PerHostJob.instance_id(template.id(), host.name())
+        if job_id in self._jobs or job_id in self._deleted_jobs:
+            return
+        try:
+            if not template.compatible_with_host(host):
+                return
+        except Exception as e:
+            self._events.error(
+                f"compatible_with_host of {template.id()} raised "
+                f"{type(e).__name__}: {e}; not running it on {host.name()}."
+            )
+            return
+        experiment = self._experiments.get(template.experiment())
+        if experiment is None:
+            experiment = Experiment(template.experiment(), template.outdir())
+            self._experiments[template.experiment()] = experiment
+        job = template.instance(host.name())
+        experiment.register_job(job)
+        self._jobs[job.id()] = job
+        origin = self._job_origin.get(template.id())
+        if origin is not None:
+            self._job_origin[job.id()] = origin
+        self._record_dependencies(job)
+        self._dirty = True
+
+    def _register_template(self, template: PerHostJob, origin: str) -> bool:
+        if template.id() in self._templates:
+            return False
+        if template.experiment() in self._deleted_experiments:
+            return False
+        self._templates[template.id()] = template
+        # NOTE: Templates aren't jobs, but `delete --script` needs to know
+        # which script defined them.
+        self._job_origin[template.id()] = origin
+        for host in self._hosts.values():
+            self._instantiate(template, host)
+        return True
+
+    def _check_dependencies(self, experiments: list[Experiment]) -> None:
+        """Refuse a script whose jobs depend on unknown jobs, or on each
+        other in a cycle. Called before anything is loaded."""
+        defined = {
+            job.id(): job
+            for experiment in experiments
+            for job in experiment.jobs()
+        }
+        for job in defined.values():
+            for parent in job.parents():
+                if (
+                    isinstance(parent, Job)
+                    and parent.id() not in defined
+                    and parent.id() not in self._jobs
+                ):
+                    raise CommandError(
+                        f"job {job.id()[:12]} depends on {parent.id()[:12]}, "
+                        "which is neither loaded nor registered in an "
+                        "experiment of this script"
+                    )
+        graph = {job_id: plain for job_id, (plain, _) in self._deps.items()}
+        for job_id, job in defined.items():
+            graph.setdefault(job_id, self._dependency_ids(job)[0])
+        done: set[str] = set()
+
+        def visit(job_id: str, path: list[str]) -> None:
+            if job_id in path:
+                cycle = path[path.index(job_id) :] + [job_id]
+                raise CommandError(
+                    "dependency cycle: "
+                    + " -> ".join(step[:12] for step in cycle)
+                )
+            if job_id in done:
+                return
+            for parent_id in graph.get(job_id, ()):
+                visit(parent_id, path + [job_id])
+            done.add(job_id)
+
+        for job_id in graph:
+            visit(job_id, [])
 
     def _load(self, script: Path, merge: bool) -> list[str]:
         script = Path(script).expanduser().resolve()
         if not script.is_file() or script.suffix != ".py":
             raise CommandError(f"{script} is not a Python file")
         hosts, experiments = _load_objects(script)
+        self._check_dependencies(experiments)
+        templates = {
+            template.id(): template
+            for experiment in experiments
+            for template in experiment.per_host_jobs()
+        }
+        for experiment in experiments:
+            for job in experiment.jobs():
+                for parent in job.parents():
+                    if isinstance(parent, PerHostJob):
+                        templates.setdefault(parent.id(), parent)
         lines = []
+        new_jobs: list[Job] = []
 
         for host in hosts:
             if host.name() in self._hosts:
@@ -853,6 +1099,7 @@ class Scheduler:
                 existing.register_job(job)
                 self._jobs[job.id()] = job
                 self._job_origin[job.id()] = origin
+                new_jobs.append(job)
                 added += 1
             defined = {job.id() for job in experiment.jobs()}
             stale = [
@@ -869,6 +1116,19 @@ class Scheduler:
                 )
         if skipped_deleted:
             lines.append(f"{skipped_deleted} deleted job(s) skipped")
+
+        for template in templates.values():
+            if self._register_template(template, origin):
+                count = sum(
+                    1
+                    for host in self._hosts
+                    if PerHostJob.instance_id(template.id(), host) in self._jobs
+                )
+                lines.append(
+                    f"added per-host job {template.id()} ({count} host(s))"
+                )
+        for job in new_jobs:
+            self._record_dependencies(job)
 
         self._scripts[origin] = _sha256(script)
         self._dirty = True
@@ -1073,9 +1333,15 @@ class Scheduler:
                 if self._job_origin.get(job_id) == path
             ]
             self._refuse_if_active(owned, f"script {script}")
+            self._refuse_if_needed(
+                {job.id() for job in owned}, f"script {script}"
+            )
             touched = {job.experiment() for job in owned}
             for job in owned:
                 self._forget_job(job)
+            for template_id in list(self._templates):
+                if self._job_origin.get(template_id) == path:
+                    self._forget_template(template_id)
             emptied = [
                 name
                 for name in sorted(touched)
@@ -1095,6 +1361,9 @@ class Scheduler:
         if experiment is not None:
             target = self._experiment(experiment)
             self._refuse_if_active(target.jobs(), f"experiment {experiment}")
+            self._refuse_if_needed(
+                {job.id() for job in target.jobs()}, f"experiment {experiment}"
+            )
             count = len(target.jobs())
             self._remove_experiment(experiment)
             self._deleted_experiments.add(experiment)
@@ -1103,10 +1372,28 @@ class Scheduler:
         if not jobs:
             raise CommandError("nothing to delete")
         lines, deleted = [], 0
-        for prefix in jobs:
-            job = self._resolve_job(prefix)
+        targets = [self._resolve_job(prefix) for prefix in jobs]
+        # NOTE: Jobs deleted together may depend on each other.
+        selected = {job.id() for job in targets}
+        for job in targets:
             if job.status().active():
                 lines.append(f"{job.id()[:8]}: skipped, it is {job.status()}")
+                continue
+            dependents = self._pending_dependents(selected | {job.id()})
+            needing = [
+                d for d in dependents
+                if job.id() in self._deps[d.id()][0]
+                or any(
+                    PerHostJob.instance_id(t, job.pinned_host() or "")
+                    == job.id()
+                    for t in self._deps[d.id()][1]
+                )
+            ]
+            if needing:
+                lines.append(
+                    f"{job.id()[:8]}: skipped, {len(needing)} job(s) that "
+                    "haven't run yet depend on it"
+                )
                 continue
             self._forget_job(job)
             self._deleted_jobs.add(job.id())

@@ -8,7 +8,9 @@ from hashlib import sha256
 from pathlib import Path
 from typing import List, Optional
 
-from ..api.work import Job, Experiment, ProjectConfiguration
+from ..api.runner import JOB_DIR
+from ..api.simulate import RunSpec
+from ..api.work import Job, Experiment, PerHostJob, ProjectConfiguration
 from .log import warn
 
 
@@ -186,6 +188,8 @@ class gem5Job(Job):
 
     Positional args are passed as they are; each keyword argument becomes
     `--key-name value` (or just `--key-name` for OtherValues.Store_Const).
+    The run is described by a RunSpec saved as <outdir>/.job/run.json;
+    `helper run --spec <that file>` reruns it by hand.
     """
 
     @staticmethod
@@ -280,16 +284,21 @@ class gem5Job(Job):
             ]
         )
         outdir = experiment.outdir() / id
+        self._run_spec = RunSpec(
+            binary=str(experiment.gem5_path()),
+            script=str(run_script_path),
+            script_args=gem5Job._cli_args(args, kwargs, shorten=False),
+            outdir=str(outdir),
+            cwd=str(experiment.cwd()),
+        )
+        spec_path = outdir / JOB_DIR / "run.json"
         super().__init__(
             experiment.name(),
             experiment.cwd(),
-            gem5Job.make_command(
-                experiment.gem5_path(),
-                outdir,
-                run_script_path,
-                *args,
-                **kwargs,
-            ),
+            # NOTE: The worker's Python runs the spec and becomes gem5; see
+            # experiment.api.simulate.
+            '"$EXPERIMENT_PYTHON" -m experiment.api.simulate '
+            + shlex.quote(str(spec_path)),
             gem5Job.make_shorthand_command(
                 experiment.gem5_path(), run_script_path, *args, **kwargs
             ),
@@ -307,16 +316,83 @@ class gem5Job(Job):
                         experiment, demand, run_script_path, *args, **kwargs
                     ),
                     outdir / "constructor.py",
-                )
+                ),
+                ("run.json", self._run_spec.to_json(), spec_path),
             ],
         )
         self._run_script_path = run_script_path
         self._args = args
         self._kwargs = kwargs
+        if experiment.build() is not None:
+            self.depends_on(experiment.build())
+
+    def run_spec(self) -> RunSpec:
+        return self._run_spec
+
+    def display_command(self) -> str:
+        return shlex.join(self._run_spec.argv())
 
 
 # NOTE: Old name, kept so existing experiment scripts keep working.
 gem5FSSimulation = gem5Job
+
+
+class gem5Build(PerHostJob):
+    """Build gem5 on every compatible host, into that host's build dir.
+
+    One job per host (they appear as `<id>@<host>`), each running the same
+    backend as `helper build` on its worker. Jobs of a gem5Experiment made
+    with `build=` this run only on hosts where this build succeeded.
+    Override `compatible_with_host` to build on fewer hosts.
+    """
+
+    def __init__(
+        self,
+        config: "gem5ProjectConfiguration",
+        name: str,
+        threads: int | None = None,
+        experiment: str = "builds",
+        **options,
+    ):
+        """
+        :param options: isas, protocols, binary_opt, bits_per_set, linker,
+            gprof, no_tcmalloc, as for `helper build`; unset ones take the
+            project's defaults.
+        """
+        # NOTE: Imported here: experiment.api.build imports this module.
+        from ..api.build import BuildSpec
+
+        self._spec = BuildSpec.from_project(
+            config, name, threads=threads, **options
+        )
+        paths = config.path_config()
+        super().__init__(
+            experiment,
+            f"build-{config.name()}-{name}",
+            paths.gem5_out_base_dir() / experiment / name,
+        )
+        self._cwd = paths.project_dir()
+        self._threads = threads or 1
+
+    def spec(self):
+        return self._spec
+
+    def binary(self) -> Path:
+        return self._spec.binary()
+
+    def make_job(self, host_name: str, id: str, outdir: Path) -> Job:
+        spec_path = outdir / JOB_DIR / "build.json"
+        return Job(
+            self.experiment(),
+            self._cwd,
+            '"$EXPERIMENT_PYTHON" -m experiment.api.build '
+            + shlex.quote(str(spec_path)),
+            f"build {self._spec.name}",
+            outdir,
+            self._threads,
+            id,
+            dumps=[("build.json", self._spec.to_json(), spec_path)],
+        )
 
 
 class gem5Experiment(Experiment):
@@ -324,18 +400,35 @@ class gem5Experiment(Experiment):
         self,
         name: str,
         cwd: Path,
-        gem5_path: Path,
-        outdir: Path,
+        gem5_path: Path | None = None,
+        outdir: Path | None = None,
+        build: gem5Build | None = None,
     ):
+        """
+        :param build: a gem5Build; every job of this experiment then
+            depends on it and runs its binary (`gem5_path` is not needed).
+        """
+        if outdir is None:
+            raise ValueError(f"gem5Experiment {name}: outdir is required")
+        if gem5_path is None and build is None:
+            raise ValueError(
+                f"gem5Experiment {name}: give gem5_path or build"
+            )
         super().__init__(name, Path(outdir).resolve())
         self._cwd = Path(cwd).resolve()
-        self._gem5_path = Path(gem5_path).resolve()
+        self._build = build
+        self._gem5_path = Path(
+            gem5_path if gem5_path is not None else build.binary()
+        ).resolve()
 
     def cwd(self) -> Path:
         return self._cwd
 
     def gem5_path(self) -> Path:
         return self._gem5_path
+
+    def build(self) -> gem5Build | None:
+        return self._build
 
 
 class gem5BuildConfiguration:

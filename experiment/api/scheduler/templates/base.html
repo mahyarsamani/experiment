@@ -82,7 +82,7 @@
 
   <script id="initial-state" type="application/json">{{ state|tojson }}</script>
   <script>
-    const STATUSES = ["queued", "launching", "running", "unknown", "exited", "failed", "killed"];
+    const STATUSES = ["waiting", "blocked", "queued", "launching", "running", "unknown", "exited", "failed", "killed"];
     const ACTIVE = ["launching", "running", "unknown"];
     const FINISHED = ["exited", "failed", "killed"];
 

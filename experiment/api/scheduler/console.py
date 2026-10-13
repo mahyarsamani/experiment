@@ -217,6 +217,9 @@ def build_parser() -> tuple[ConsoleParser, dict[str, ConsoleParser]]:
     filters(p)
     confirm(p)
 
+    p = add("deps", "Show what a job depends on and what depends on it.")
+    _arg(p, "job", completer="job")
+
     p = add("kill", "Kill all jobs of an experiment and remove it.")
     _arg(p, "experiment", completer="experiment")
 
@@ -624,6 +627,56 @@ class Console:
         )
         print(f"{len(jobs)} job(s)")
 
+    def _print_deps(self, args) -> None:
+        jobs = {job["id"]: job for job in self._client.snapshot(max_age=0)["jobs"]}
+        matches = [job_id for job_id in jobs if job_id.startswith(args.job)]
+        if len(matches) != 1:
+            raise ConsoleError(
+                f"{args.job!r} matches {len(matches)} jobs; give a longer prefix"
+            )
+        job = jobs[matches[0]]
+        ids = short_ids(list(jobs))
+
+        def describe(job_id: str) -> str:
+            other = jobs.get(job_id)
+            if other is None:
+                return f"{job_id} (deleted)"
+            return f"{ids[job_id]} {other['status']}  {other['command']}"
+
+        print(describe(job["id"]))
+        if job.get("message"):
+            print(f"  {job['message']}")
+        parents = job.get("depends_on", [])
+        per_host = job.get("depends_on_per_host", [])
+        if parents or per_host:
+            print("depends on:")
+        for parent in parents:
+            print(f"  {describe(parent)}")
+        for template in per_host:
+            instances = sorted(
+                other
+                for other in jobs
+                if other.startswith(f"{template}@")
+            )
+            print(f"  {template} (per host):")
+            for instance in instances:
+                print(f"    {instance.split('@', 1)[1]}: {jobs[instance]['status']}")
+        if job.get("ready_hosts") is not None:
+            print(f"ready on: {', '.join(job['ready_hosts']) or 'no host yet'}")
+        template = job["id"].split("@", 1)[0] if job.get("pinned_host") else None
+        children = [
+            other["id"]
+            for other in jobs.values()
+            if job["id"] in other.get("depends_on", [])
+            or (template and template in other.get("depends_on_per_host", []))
+        ]
+        if children:
+            print(f"needed by {len(children)} job(s):")
+            for child in children[:20]:
+                print(f"  {describe(child)}")
+            if len(children) > 20:
+                print(f"  ... {len(children) - 20} more")
+
     def _print_events(self, args) -> None:
         events = self._client.events(0)[-max(1, args.n) :]
         for event in events:
@@ -762,6 +815,7 @@ class Console:
             "hosts": self._print_hosts,
             "experiments": self._print_experiments,
             "jobs": self._print_jobs,
+            "deps": self._print_deps,
             "events": self._print_events,
             "info": self._print_info,
         }

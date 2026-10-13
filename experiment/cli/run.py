@@ -1,9 +1,10 @@
 import argparse
+import time
 
 from pathlib import Path
 
-from ..common.cmd_util import run_command
-from ..common.log import warn
+from ..api.simulate import RunSpec, Simulator
+from ..common.log import info, warn
 from ..common.gem5_work import (
     BinaryOpt,
     gem5BuildConfiguration,
@@ -11,15 +12,28 @@ from ..common.gem5_work import (
 
 
 def parse_run_args(args):
-    parser = argparse.ArgumentParser(prog="helper run", description="Run gem5.")
+    parser = argparse.ArgumentParser(
+        prog="helper run",
+        description="Run gem5. Either give a build name and a config "
+        "script, or --spec to rerun a scheduled job exactly as it ran.",
+    )
     parser.add_argument(
         "build_name",
         type=str,
+        nargs="?",
         help="Build name to use for gem5 compilation.",
     )
 
-    parser.add_argument("config", type=str, help="Config script to simulate.")
+    parser.add_argument(
+        "config", type=str, nargs="?", help="Config script to simulate."
+    )
 
+    parser.add_argument(
+        "--spec",
+        type=Path,
+        help="A job's run spec (<job outdir>/.job/run.json) to rerun; its "
+        "outputs go to a new directory unless --outdir is given.",
+    )
     parser.add_argument(
         "--binary_opt",
         type=str,
@@ -86,76 +100,96 @@ def parse_run_args(args):
     return parser.parse_known_args(args)
 
 
-def _process_run_args(proj_config, run_args, unknown_args) -> int:
-    def _check_arg_validity(run_args):
-        if run_args.gdbinit is not None and not run_args.gdb:
-            raise ValueError("gdb-init requires --with-gdb flag.")
+def _find_config(path_config, config: str) -> Path:
+    path = Path(config)
+    if path.is_absolute():
+        return path
+    if path.resolve().exists():
+        return path.resolve()
+    if (path_config.project_dir() / path).exists():
+        return (path_config.project_dir() / path).resolve()
+    raise FileNotFoundError(
+        "Tried looking for script as an absolute path, relative to your "
+        f"cwd ({Path.cwd()}), and relative to project base directory "
+        f"({path_config.project_dir()}). None of them exist."
+    )
 
-    _check_arg_validity(run_args)
+
+def _spec_from_args(proj_config, run_args, unknown_args) -> RunSpec:
+    if run_args.build_name is None or run_args.config is None:
+        raise ValueError("give a build name and a config script, or --spec")
     path_config = proj_config.path_config()
     build_config = gem5BuildConfiguration.from_args_and_config(
         run_args, proj_config.build_config()
     )
-    gem5_path = (
-        path_config.gem5_binary_base_dir()
-        / run_args.build_name
-        / f"gem5.{build_config.binary_opt}"
-    )
-    if not gem5_path.exists():
-        raise FileNotFoundError(
-            f"gem5 binary not found at {gem5_path}. "
-            "Please run the build command first."
-        )
-
-    command = f"{gem5_path}"
-    if run_args.outdir is not None:
-        outdir = path_config.gem5_out_base_dir() / run_args.outdir
-        command += f" -re --outdir={outdir}"
-    if run_args.debug_flags is not None:
-        command += f" --debug-flags={run_args.debug_flags}"
-    if run_args.debug_start is not None:
-        command += f" --debug-start={run_args.debug_start}"
-    if run_args.debug_end is not None:
-        command += f" --debug-end={run_args.debug_end}"
-    if run_args.gdb:
-        if run_args.gdbinit is not None:
-            command = f"gdb -x {run_args.gdbinit} --args {command}"
-        else:
-            command = f"gdb --args {command}"
-
+    env = {}
     if run_args.gem5_resource_json is not None:
-        command = (
-            f"GEM5_RESOURCE_JSON_APPEND={run_args.gem5_resource_json} "
-            + command
-        )
+        env["GEM5_RESOURCE_JSON_APPEND"] = run_args.gem5_resource_json
     elif path_config.gem5_resource_json_path() is not None:
-        command = (
-            f"GEM5_RESOURCE_JSON_APPEND={path_config.gem5_resource_json_path()} "
-            + command
+        env["GEM5_RESOURCE_JSON_APPEND"] = str(
+            path_config.gem5_resource_json_path()
         )
     else:
         warn(
             "GEM5_RESOURCE_JSON_APPEND not specified or defined by project configuration."
         )
-
     if run_args.override:
-        command = "M5_OVERRIDE_PY_SOURCE=true " + command
+        env["M5_OVERRIDE_PY_SOURCE"] = "true"
+    outdir = (
+        str(path_config.gem5_out_base_dir() / run_args.outdir)
+        if run_args.outdir is not None
+        else None
+    )
+    return RunSpec(
+        binary=str(
+            path_config.gem5_binary_base_dir()
+            / run_args.build_name
+            / f"gem5.{build_config.binary_opt}"
+        ),
+        script=str(_find_config(path_config, run_args.config)),
+        script_args=list(unknown_args),
+        outdir=outdir,
+        redirect=outdir is not None,
+        debug_flags=run_args.debug_flags,
+        debug_start=run_args.debug_start,
+        debug_end=run_args.debug_end,
+        env=env,
+        cwd=str(path_config.project_dir()),
+    )
 
-    config = Path(run_args.config)
-    if config.is_absolute():
-        command += f" {config}"
-    elif config.resolve().exists():
-        command += f" {config.resolve()}"
-    elif (path_config.project_dir() / config).exists():
-        command += f" {(path_config.project_dir() / config).resolve()}"
-    else:
-        raise FileNotFoundError(
-            "Tried looking for script as an absolute path, relative to your "
-            f"cwd ({Path.cwd()}), and relative to project base directory "
-            f"({path_config.project_dir()}). None of them exist."
+
+def _spec_from_job(run_args, unknown_args) -> RunSpec:
+    """The job's spec, with the debugging options given on the command
+    line, writing to a new directory so the job's outputs stay intact."""
+    if run_args.build_name or run_args.config or unknown_args:
+        raise ValueError(
+            "--spec reruns a job as it ran; it takes no build name, config "
+            "script or script arguments"
         )
+    spec = RunSpec.load(run_args.spec)
+    if run_args.outdir is not None:
+        spec.outdir = str(Path(run_args.outdir).resolve())
+    else:
+        spec.outdir = str(
+            Path(spec.outdir or Path.cwd())
+            / f"rerun-{time.strftime('%Y%m%d-%H%M%S')}"
+        )
+    for option in ("debug_flags", "debug_start", "debug_end"):
+        if getattr(run_args, option) is not None:
+            setattr(spec, option, getattr(run_args, option))
+    if run_args.override:
+        spec.env["M5_OVERRIDE_PY_SOURCE"] = "true"
+    if run_args.gem5_resource_json is not None:
+        spec.env["GEM5_RESOURCE_JSON_APPEND"] = run_args.gem5_resource_json
+    info(f"Rerunning {run_args.spec}; outputs go to {spec.outdir}")
+    return spec
 
-    for unknown_arg in unknown_args:
-        command += f" {unknown_arg}"
 
-    return run_command(["bash", "-c", command], path_config.project_dir())
+def _process_run_args(proj_config, run_args, unknown_args) -> int:
+    if run_args.gdbinit is not None and not run_args.gdb:
+        raise ValueError("gdb-init requires --with-gdb flag.")
+    if run_args.spec is not None:
+        spec = _spec_from_job(run_args, unknown_args)
+    else:
+        spec = _spec_from_args(proj_config(), run_args, unknown_args)
+    return Simulator(spec).run(gdb=run_args.gdb, gdbinit=run_args.gdbinit)

@@ -216,6 +216,9 @@ def main(argv: list[str] | None = None) -> int:
             child = subprocess.Popen(
                 ["bash", "-c", command],
                 cwd=args.cwd,
+                # NOTE: So job commands can run this package's modules with
+                # the worker's own Python, e.g. experiment.api.simulate.
+                env=dict(os.environ, EXPERIMENT_PYTHON=sys.executable),
                 stdin=subprocess.DEVNULL,
                 stdout=out,
                 stderr=err,

@@ -30,7 +30,8 @@ def _dispatch(command: str, args: list[str]) -> int | None:
         from ..common.config_util import _get_project_config
         from .run import parse_run_args, _process_run_args
 
-        return _process_run_args(_get_project_config(), *parse_run_args(args))
+        # NOTE: Passed uncalled: `run --spec` works outside any project.
+        return _process_run_args(_get_project_config, *parse_run_args(args))
     if command == "work":
         from .work import parse_work_args, _process_work_args
 

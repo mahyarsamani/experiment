@@ -20,9 +20,15 @@ class JobStatus(Enum):
     # NOTE: The job was launched but its host can't be reached, so we don't
     # know. It is never relaunched automatically.
     UNKNOWN = "unknown"
+    # NOTE: Not launched yet because of dependencies: still to finish
+    # (waiting), or failed and need a reset (blocked).
+    WAITING = "waiting"
+    BLOCKED = "blocked"
 
     def color(self) -> str:
         return {
+            JobStatus.WAITING: "#93C5FD",
+            JobStatus.BLOCKED: "#F97316",
             JobStatus.QUEUED: "#FAFAFA",
             JobStatus.LAUNCHING: "#F59E0B",
             JobStatus.RUNNING: "#10B981",
@@ -43,6 +49,10 @@ class JobStatus(Enum):
     def terminal(self) -> bool:
         return self in (JobStatus.EXITED, JobStatus.FAILED, JobStatus.KILLED)
 
+    def pending(self) -> bool:
+        """Not launched yet: queued, waiting or blocked."""
+        return self in (JobStatus.QUEUED, JobStatus.WAITING, JobStatus.BLOCKED)
+
     def __str__(self) -> str:
         return self.value
 
@@ -59,6 +69,7 @@ class Job:
         id: str,
         aux_files: Sequence[Tuple[str, Path]] = (),
         dumps: Sequence[Tuple[str, str, Path]] = (),
+        after: Iterable["Job | PerHostJob"] = (),
     ) -> None:
         """
         :param aux_files: (label, path) of extra output files to show on the
@@ -66,6 +77,7 @@ class Job:
             inside `outdir`.
         :param dumps: (label, content, path) of files the worker writes
             before launching the job. Paths must be inside `outdir`.
+        :param after: jobs this one depends on; see `depends_on`.
         """
         self._experiment = experiment
         self._cwd = Path(cwd)
@@ -87,6 +99,37 @@ class Job:
         self._end_time: float | None = None
         # NOTE: Requeues asked for by the watcher since the last `reset`.
         self._retries = 0
+
+        self._parents: list[Job | PerHostJob] = []
+        # NOTE: Set on the instances of a PerHostJob: the only host they
+        # may run on.
+        self._pinned_host: str | None = None
+        self.depends_on(*after)
+
+    def depends_on(self, *parents: "Job | PerHostJob") -> "Job":
+        """Run this job only after `parents` have exited successfully.
+
+        A Job parent has to exit once, on any host. A PerHostJob parent
+        has to exit on the host this job runs on, so this job only runs on
+        hosts where it did. Returns self, so calls can be chained.
+        """
+        for parent in parents:
+            if not isinstance(parent, (Job, PerHostJob)):
+                raise TypeError(
+                    f"{self._id}: a dependency must be a Job or a "
+                    f"PerHostJob, not {type(parent).__name__}"
+                )
+            if parent is self:
+                raise ValueError(f"{self._id} can't depend on itself")
+            if all(parent is not known for known in self._parents):
+                self._parents.append(parent)
+        return self
+
+    def parents(self) -> list["Job | PerHostJob"]:
+        return list(self._parents)
+
+    def pinned_host(self) -> str | None:
+        return self._pinned_host
 
     # NOTE: Watcher settings; override in a subclass along with `watcher`.
     watch_interval = 60
@@ -128,6 +171,11 @@ class Job:
 
     def shorthand_command(self) -> str:
         return self._shorthand_command
+
+    def display_command(self) -> str:
+        """The command to show people; subclasses whose `command` is a
+        wrapper (e.g. gem5Job) show what it runs instead."""
+        return self._command
 
     def outdir(self) -> Path:
         return self._outdir
@@ -217,6 +265,11 @@ class Job:
         self._status = JobStatus.LAUNCHING
         self._clear_run()
 
+    def set_pending(self, status: JobStatus, reason: str | None) -> None:
+        """Queued, waiting or blocked, as its dependencies allow."""
+        self._status = status
+        self._message = reason
+
     def reset(self) -> bool:
         if self._status.active():
             return False
@@ -278,7 +331,7 @@ class Job:
             "id": self._id,
             "experiment": self._experiment,
             "command": self._shorthand_command,
-            "full_command": self._command,
+            "full_command": self.display_command(),
             "demand": self._demand,
             "host": self._host_name or "",
             "status": self._status.value,
@@ -288,6 +341,7 @@ class Job:
             "start_time": self._start_time,
             "end_time": self._end_time,
             "retries": self._retries,
+            "pinned_host": self._pinned_host,
             "files": [label for label, _ in self.files()],
             "outdir": str(self._outdir),
         }
@@ -302,11 +356,63 @@ class Job:
         return self.__str__()
 
 
+class PerHostJob:
+    """A job to run once on each host, like a build to a host-local disk.
+
+    The scheduler makes one instance (a Job, from `make_job`) for every
+    host this accepts in `compatible_with_host`, as soon as it knows the
+    host, and runs it there. A job that depends on a PerHostJob runs only
+    on hosts where its instance exited successfully.
+    """
+
+    def __init__(self, experiment: str, id: str, outdir: Path) -> None:
+        self._experiment = experiment
+        self._id = id
+        self._outdir = Path(outdir)
+
+    def experiment(self) -> str:
+        return self._experiment
+
+    def id(self) -> str:
+        return self._id
+
+    def outdir(self) -> Path:
+        return self._outdir
+
+    def compatible_with_host(self, host: "Host") -> bool:
+        """Which hosts get an instance. Override to restrict it."""
+        return True
+
+    def make_job(self, host_name: str, id: str, outdir: Path) -> Job:
+        """The Job to run on `host_name`, with this id and outdir."""
+        raise NotImplementedError
+
+    @staticmethod
+    def instance_id(template_id: str, host_name: str) -> str:
+        return f"{template_id}@{host_name}"
+
+    def instance(self, host_name: str) -> Job:
+        job = self.make_job(
+            host_name,
+            self.instance_id(self._id, host_name),
+            self._outdir / host_name,
+        )
+        job._pinned_host = host_name
+        return job
+
+    def __str__(self) -> str:
+        return f"{self.__class__.__name__}(id={self._id})"
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+
 class Experiment:
     def __init__(self, name: str, outdir: Path) -> None:
         self._name = name
         self._outdir = Path(outdir)
         self._jobs: dict[str, Job] = dict()
+        self._per_host: dict[str, PerHostJob] = dict()
 
     def name(self) -> str:
         return self._name
@@ -314,12 +420,20 @@ class Experiment:
     def outdir(self) -> Path:
         return self._outdir
 
-    def register_job(self, job: Job) -> bool:
+    def register_job(self, job: "Job | PerHostJob") -> bool:
         """Returns False (and ignores the job) if its id is already here."""
+        if isinstance(job, PerHostJob):
+            if job.id() in self._per_host:
+                return False
+            self._per_host[job.id()] = job
+            return True
         if job.id() in self._jobs:
             return False
         self._jobs[job.id()] = job
         return True
+
+    def per_host_jobs(self) -> list[PerHostJob]:
+        return list(self._per_host.values())
 
     def jobs(self) -> list[Job]:
         return list(self._jobs.values())
@@ -334,6 +448,7 @@ class Experiment:
         self,
         capacity: int,
         accepts: Callable[[Job], bool] = lambda job: True,
+        demand: Callable[[Job], int] = lambda job: job.demand(),
     ) -> Job | None:
         """The largest queued job that fits in `capacity` and `accepts`."""
         return max(
@@ -341,10 +456,10 @@ class Experiment:
                 job
                 for job in self._jobs.values()
                 if job.status() == JobStatus.QUEUED
-                and job.demand() <= capacity
+                and demand(job) <= capacity
                 and accepts(job)
             ),
-            key=lambda j: j.demand(),
+            key=demand,
             default=None,
         )
 
